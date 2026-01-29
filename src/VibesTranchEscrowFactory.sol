@@ -23,6 +23,9 @@ contract VibesTranchEscrowFactory {
     /// @notice Time oracle (0x0 for production, mock for testnet)
     address public timeOracle;
 
+    /// @notice Authorized router for LP withdrawals
+    address public authorizedRouter;
+
     /// @notice All deployed escrows
     address[] public escrows;
 
@@ -46,6 +49,7 @@ contract VibesTranchEscrowFactory {
     event AdminUpdated(address indexed oldAdmin, address indexed newAdmin);
     event PlatformWalletUpdated(address indexed oldWallet, address indexed newWallet);
     event TimeOracleUpdated(address indexed oldOracle, address indexed newOracle);
+    event AuthorizedRouterUpdated(address indexed oldRouter, address indexed newRouter);
 
     // ============ Errors ============
 
@@ -65,20 +69,24 @@ contract VibesTranchEscrowFactory {
     /// @param _admin Platform admin
     /// @param _platformWallet Platform fee wallet
     /// @param _timeOracle Time oracle (0x0 for production)
+    /// @param _authorizedRouter Router authorized for LP withdrawals
     constructor(
         address _implementation,
         address _admin,
         address _platformWallet,
-        address _timeOracle
+        address _timeOracle,
+        address _authorizedRouter
     ) {
         if (_implementation == address(0)) revert ZeroAddress();
         if (_admin == address(0)) revert ZeroAddress();
         if (_platformWallet == address(0)) revert ZeroAddress();
+        if (_authorizedRouter == address(0)) revert ZeroAddress();
 
         implementation = _implementation;
         admin = _admin;
         platformWallet = _platformWallet;
         timeOracle = _timeOracle;
+        authorizedRouter = _authorizedRouter;
     }
 
     // ============ Factory Functions ============
@@ -113,7 +121,8 @@ contract VibesTranchEscrowFactory {
             _deadline,
             admin,
             platformWallet,
-            timeOracle
+            timeOracle,
+            authorizedRouter
         );
 
         // Track the escrow
@@ -158,6 +167,14 @@ contract VibesTranchEscrowFactory {
         address oldOracle = timeOracle;
         timeOracle = _newOracle;
         emit TimeOracleUpdated(oldOracle, _newOracle);
+    }
+
+    /// @notice Update authorized router
+    function setAuthorizedRouter(address _newRouter) external onlyAdmin {
+        if (_newRouter == address(0)) revert ZeroAddress();
+        address oldRouter = authorizedRouter;
+        authorizedRouter = _newRouter;
+        emit AuthorizedRouterUpdated(oldRouter, _newRouter);
     }
 
     // ============ View Functions ============

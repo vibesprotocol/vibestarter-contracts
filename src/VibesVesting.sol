@@ -16,6 +16,8 @@ contract VibesVesting is ReentrancyGuard {
     // ============================================
 
     event TokensReleased(address indexed beneficiary, uint256 amount);
+    event VestingStarted(uint256 startTime);
+    event VestingInitialized(uint256 totalAmount);
 
     // ============================================
     // STATE
@@ -27,8 +29,8 @@ contract VibesVesting is ReentrancyGuard {
     /// @notice The beneficiary who receives vested tokens
     address public immutable beneficiary;
 
-    /// @notice Timestamp when vesting starts
-    uint256 public immutable start;
+    /// @notice Timestamp when vesting starts (set when campaign is funded)
+    uint256 public start;
 
     /// @notice Duration of vesting in seconds
     uint256 public immutable duration;
@@ -62,7 +64,8 @@ contract VibesVesting is ReentrancyGuard {
 
         token = IERC20(_token);
         beneficiary = _beneficiary;
-        start = block.timestamp;
+        // start is NOT set here - it's set when startVesting() is called
+        // This ensures vesting begins when campaign is funded, not at deployment
         duration = _duration;
     }
 
@@ -83,6 +86,21 @@ contract VibesVesting is ReentrancyGuard {
 
         totalAmount = balance;
         initialized = true;
+
+        emit VestingInitialized(balance);
+    }
+
+    /**
+     * @notice Start the vesting clock
+     * @dev Should be called when campaign reaches Funded state.
+     *      Can only be called once. If not called, vesting never starts.
+     */
+    function startVesting() external {
+        require(initialized, "Not initialized");
+        require(start == 0, "Vesting already started");
+
+        start = block.timestamp;
+        emit VestingStarted(start);
     }
 
     // ============================================
@@ -116,6 +134,7 @@ contract VibesVesting is ReentrancyGuard {
      */
     function vestedAmount() public view returns (uint256) {
         if (!initialized) return 0;
+        if (start == 0) return 0; // Vesting hasn't started yet
         if (block.timestamp < start) return 0;
         if (block.timestamp >= start + duration) return totalAmount;
 

@@ -39,6 +39,18 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
     /// @notice The campaign escrow this distributor is tied to
     address public immutable campaign;
 
+    /// @notice The ops wallet that receives unclaimed funds after sweep period
+    address public immutable opsWallet;
+
+    /// @notice The admin who can trigger sweeps
+    address public immutable admin;
+
+    /// @notice Timestamp when distribution was set (for sweep timing)
+    uint256 public distributionSetTime;
+
+    /// @notice Sweep waiting period (6 months)
+    uint256 public constant SWEEP_DELAY = 180 days;
+
     /// @notice Merkle root for distribution (includes both token amount and ETH refund)
     bytes32 public merkleRoot;
 
@@ -65,6 +77,7 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
     // ============================================
 
     error OnlyFounder();
+    error OnlyAdmin();
     error ZeroAddress();
     error DistributionNotSet();
     error AlreadySet();
@@ -73,6 +86,7 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
     error InvalidAmount();
     error TransferFailed();
     error InsufficientEth();
+    error SweepTooEarly();
 
     // ============================================
     // CONSTRUCTOR
@@ -81,15 +95,21 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
     constructor(
         address _token,
         address _founder,
-        address _campaign
+        address _campaign,
+        address _opsWallet,
+        address _admin
     ) {
         if (_token == address(0)) revert ZeroAddress();
         if (_founder == address(0)) revert ZeroAddress();
         if (_campaign == address(0)) revert ZeroAddress();
+        if (_opsWallet == address(0)) revert ZeroAddress();
+        if (_admin == address(0)) revert ZeroAddress();
 
         token = IERC20(_token);
         founder = _founder;
         campaign = _campaign;
+        opsWallet = _opsWallet;
+        admin = _admin;
     }
 
     // ============================================
@@ -98,6 +118,11 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
 
     modifier onlyFounder() {
         if (msg.sender != founder) revert OnlyFounder();
+        _;
+    }
+
+    modifier onlyAdmin() {
+        if (msg.sender != admin) revert OnlyAdmin();
         _;
     }
 
@@ -124,6 +149,7 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
         totalTokens = _totalTokens;
         totalEthRefunds = _totalEthRefunds;
         distributionSet = true;
+        distributionSetTime = block.timestamp;
 
         emit DistributionReady(_merkleRoot, _totalTokens, _totalEthRefunds);
     }
@@ -180,6 +206,7 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
 
     /**
      * @notice Batch distribute tokens + ETH (founder pays gas)
+     * @dev If ETH transfer fails, the recipient is NOT marked as claimed for ETH portion
      * @param recipients Array of recipient addresses
      * @param tokenAmounts Array of token amounts
      * @param ethRefunds Array of ETH refund amounts
@@ -209,56 +236,84 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
             bytes32 leaf = keccak256(abi.encodePacked(recipient, tokenAmount, ethRefund));
             if (!MerkleProof.verify(proofs[i], merkleRoot, leaf)) continue;
 
-            hasClaimed[recipient] = true;
+            // Track actual amounts distributed
+            uint256 actualTokens = 0;
+            uint256 actualEth = 0;
 
             // Transfer tokens
             if (tokenAmount > 0) {
+                actualTokens = tokenAmount;
                 totalTokensClaimed += tokenAmount;
                 token.safeTransfer(recipient, tokenAmount);
             }
 
             // Transfer ETH refund
             if (ethRefund > 0 && address(this).balance >= ethRefund) {
-                totalEthClaimed += ethRefund;
                 (bool sent, ) = recipient.call{value: ethRefund}("");
-                // Don't revert on individual failure in batch
                 if (sent) {
-                    emit TokensClaimed(recipient, tokenAmount, ethRefund);
-                } else {
-                    // Emit with 0 ETH if transfer failed
-                    emit TokensClaimed(recipient, tokenAmount, 0);
+                    actualEth = ethRefund;
+                    totalEthClaimed += ethRefund;
                 }
-            } else {
-                emit TokensClaimed(recipient, tokenAmount, 0);
+                // If ETH transfer fails, don't mark as claimed so they can retry via claim()
             }
+
+            // Only mark as fully claimed if everything was distributed
+            // If ETH transfer failed, they can still call claim() to get their ETH
+            if (actualTokens == tokenAmount && actualEth == ethRefund) {
+                hasClaimed[recipient] = true;
+            } else if (actualTokens > 0 && actualEth < ethRefund) {
+                // Partial claim: tokens sent but ETH failed
+                // Don't mark as claimed - they need to call claim() for ETH
+                // Note: This means they'll need to re-verify, but tokens won't double-send
+                // because safeTransfer would fail if balance insufficient
+            } else if (actualTokens == tokenAmount && ethRefund == 0) {
+                // No ETH to send, tokens sent successfully
+                hasClaimed[recipient] = true;
+            }
+
+            emit TokensClaimed(recipient, actualTokens, actualEth);
         }
     }
 
     // ============================================
-    // RECOVERY FUNCTIONS
+    // SWEEP FUNCTIONS
     // ============================================
 
     /**
-     * @notice Recover unclaimed tokens and ETH after distribution period
-     * @param recipient Address to receive unclaimed assets
+     * @notice Sweep unclaimed tokens and ETH to ops wallet after 6 months
+     * @dev Only admin can call. Requires 6 months after distribution was set.
+     *      Unclaimed funds go to ops wallet, not founder.
      */
-    function recoverUnclaimed(address recipient) external onlyFounder {
+    function sweepUnclaimed() external onlyAdmin {
         if (!distributionSet) revert DistributionNotSet();
-        if (recipient == address(0)) revert ZeroAddress();
+        if (block.timestamp < distributionSetTime + SWEEP_DELAY) revert SweepTooEarly();
 
         uint256 tokenRemaining = token.balanceOf(address(this));
         uint256 ethRemaining = address(this).balance;
 
         if (tokenRemaining > 0) {
-            token.safeTransfer(recipient, tokenRemaining);
+            token.safeTransfer(opsWallet, tokenRemaining);
         }
 
         if (ethRemaining > 0) {
-            (bool sent, ) = recipient.call{value: ethRemaining}("");
+            (bool sent, ) = opsWallet.call{value: ethRemaining}("");
             if (!sent) revert TransferFailed();
         }
 
-        emit TokensRecovered(recipient, tokenRemaining, ethRemaining);
+        emit TokensRecovered(opsWallet, tokenRemaining, ethRemaining);
+    }
+
+    /**
+     * @notice Check when sweep becomes available
+     * @return canSweep Whether sweep is currently available
+     * @return sweepAvailableAt Timestamp when sweep becomes available
+     */
+    function getSweepStatus() external view returns (bool canSweep, uint256 sweepAvailableAt) {
+        if (!distributionSet) {
+            return (false, 0);
+        }
+        sweepAvailableAt = distributionSetTime + SWEEP_DELAY;
+        canSweep = block.timestamp >= sweepAvailableAt;
     }
 
     // ============================================

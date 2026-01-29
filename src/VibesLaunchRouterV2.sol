@@ -6,7 +6,7 @@ import {VibesRegistry} from "./VibesRegistry.sol";
 import {VibesTranchEscrowFactory} from "./VibesTranchEscrowFactory.sol";
 import {VibesTranchEscrow} from "./VibesTranchEscrow.sol";
 import {VibesLPLocker} from "./VibesLPLocker.sol";
-import {VibesTokenDistributor} from "./VibesTokenDistributor.sol";
+import {VibesTokenDistributorV2} from "./VibesTokenDistributorV2.sol";
 import {VibesVesting} from "./VibesVesting.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -112,6 +112,9 @@ contract VibesLaunchRouterV2 is ReentrancyGuard {
     uint256 public flatFeeWei;
     address public feeRecipient;
 
+    /// @notice Ops wallet for unclaimed fund sweeps
+    address public opsWallet;
+
     /// @notice Token to escrow mapping
     mapping(address => address) public tokenToEscrow;
 
@@ -140,6 +143,8 @@ contract VibesLaunchRouterV2 is ReentrancyGuard {
     error NoPendingLP();
     error EscrowFactoryNotSet();
     error LPLockerNotSet();
+    error OpsWalletNotSet();
+    error LPNotCreated();
 
     // ============================================
     // MODIFIERS
@@ -311,10 +316,10 @@ contract VibesLaunchRouterV2 is ReentrancyGuard {
 
     /**
      * @notice Finalize a successful campaign - creates LP and enables token distribution
-     * @dev Called after campaign is finalized as Funded. Creates LP, locks it, and prepares distributor.
+     * @dev Called after campaign is finalized as Funded. Withdraws ETH from escrow, creates LP, locks it.
      * @param token Token address
      */
-    function finalizeSuccessfulCampaign(address token) external payable nonReentrant {
+    function finalizeSuccessfulCampaign(address token) external nonReentrant {
         if (address(lpLocker) == address(0)) revert LPLockerNotSet();
 
         address escrowAddr = tokenToEscrow[token];
@@ -331,18 +336,9 @@ contract VibesLaunchRouterV2 is ReentrancyGuard {
         PendingLP memory lpData = pendingLP[token];
         if (lpData.tokenAmount == 0) revert NoPendingLP();
 
-        // Calculate ETH for LP (20% of total raised)
-        uint256 totalRaised = campaign.totalRaised;
-        uint256 ethForLP = (totalRaised * ETH_TO_LP_BPS) / BPS_DENOMINATOR;
-
-        // Withdraw ETH from escrow for LP
-        // Note: The escrow holds all raised ETH. We need to transfer some to LP.
-        // This requires the escrow to have a function for this, OR we call this
-        // before any tranches are claimed, using ETH sent to this function.
-
-        // For now, require ETH to be sent with this call for LP creation
-        // (In production, you might want escrow to send ETH directly to LP locker)
-        require(msg.value >= ethForLP, "Insufficient ETH for LP");
+        // Withdraw ETH from escrow for LP (20% of effective raised)
+        // The escrow calculates this based on effectiveRaised (handles pro-rata excess)
+        uint256 ethForLP = escrow.withdrawForLP(address(lpLocker));
 
         // Approve LP locker to take tokens
         IERC20(token).approve(address(lpLocker), lpData.tokenAmount);
@@ -357,10 +353,10 @@ contract VibesLaunchRouterV2 is ReentrancyGuard {
         // Clear pending LP
         delete pendingLP[token];
 
-        // Refund excess ETH
-        if (msg.value > ethForLP) {
-            (bool sent, ) = msg.sender.call{value: msg.value - ethForLP}("");
-            require(sent, "ETH refund failed");
+        // Start founder vesting now that campaign is funded
+        address vestingAddr = tokenToVesting[token];
+        if (vestingAddr != address(0)) {
+            VibesVesting(vestingAddr).startVesting();
         }
 
         emit LPCreated(token, pool, lpData.tokenAmount, ethForLP, lpAmount);
@@ -395,18 +391,23 @@ contract VibesLaunchRouterV2 is ReentrancyGuard {
         // For now, get balance held by router
         uint256 routerBalance = IERC20(token).balanceOf(address(this));
 
-        // Deploy distributor
-        VibesTokenDistributor newDistributor = new VibesTokenDistributor(
+        // Ensure LP has been created first (enforces proper ordering)
+        if (lpData.tokenAmount > 0) revert LPNotCreated();
+        if (opsWallet == address(0)) revert OpsWalletNotSet();
+
+        // Deploy distributor with ops wallet for sweep functionality
+        VibesTokenDistributorV2 newDistributor = new VibesTokenDistributorV2(
             token,
             msg.sender,
-            escrowAddr
+            escrowAddr,
+            opsWallet,
+            owner
         );
         distributor = address(newDistributor);
         tokenToDistributor[token] = distributor;
 
         // Transfer backer tokens to distributor
-        // Subtract LP tokens if not yet used
-        uint256 backerTokens = routerBalance - lpData.tokenAmount;
+        uint256 backerTokens = routerBalance;
         if (backerTokens > 0) {
             IERC20(token).safeTransfer(distributor, backerTokens);
         }
@@ -489,6 +490,11 @@ contract VibesLaunchRouterV2 is ReentrancyGuard {
     function setLPLocker(address payable _lpLocker) external onlyOwner {
         if (_lpLocker == address(0)) revert ZeroAddress();
         lpLocker = VibesLPLocker(_lpLocker);
+    }
+
+    function setOpsWallet(address _opsWallet) external onlyOwner {
+        if (_opsWallet == address(0)) revert ZeroAddress();
+        opsWallet = _opsWallet;
     }
 
     // ============================================

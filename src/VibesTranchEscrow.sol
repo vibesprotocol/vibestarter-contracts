@@ -98,6 +98,17 @@ contract VibesTranchEscrow is ReentrancyGuard {
     mapping(address => bool) public refundClaimedFromMerkle;  // For holder refunds
     mapping(uint8 => bool) public trancheClaimed;
 
+    // Snapshot values for holder refunds (set when campaign is frozen)
+    uint256 public frozenEthBalance;
+    uint256 public frozenTotalSupply;
+
+    // LP withdrawal tracking
+    bool public lpWithdrawn;
+    address public authorizedRouter;
+
+    // Effective raised amount (after pro-rata calculations for oversubscribed campaigns)
+    uint256 public effectiveRaised;
+
     // ============ Events ============
 
     event CampaignInitialized(
@@ -126,6 +137,9 @@ contract VibesTranchEscrow is ReentrancyGuard {
     event ExcessRefund(address indexed contributor, uint256 amount);
 
     event AdminTransferred(address indexed oldAdmin, address indexed newAdmin);
+    event LPWithdrawn(address indexed lpLocker, uint256 amount);
+    event CampaignFinalized(uint256 effectiveRaised, uint256 excessForRefunds);
+    event FrozenBalanceRecorded(uint256 ethBalance, uint256 tokenSupply);
 
     // ============ Errors ============
 
@@ -150,6 +164,9 @@ contract VibesTranchEscrow is ReentrancyGuard {
     error ZeroAddress();
     error InvalidTranche();
     error AlreadyInitialized();
+    error LPAlreadyWithdrawn();
+    error OnlyRouter();
+    error ChallengeWindowOpen();
 
     // ============ Modifiers ============
 
@@ -187,6 +204,7 @@ contract VibesTranchEscrow is ReentrancyGuard {
     /// @param _admin Admin address
     /// @param _platformWallet Platform fee wallet
     /// @param _timeOracle Time oracle (0x0 for production)
+    /// @param _authorizedRouter Router authorized to withdraw LP funds
     function initialize(
         address _founder,
         address _token,
@@ -196,7 +214,8 @@ contract VibesTranchEscrow is ReentrancyGuard {
         uint256 _deadline,
         address _admin,
         address _platformWallet,
-        address _timeOracle
+        address _timeOracle,
+        address _authorizedRouter
     ) external {
         if (_initialized) revert AlreadyInitialized();
         _initialized = true;
@@ -204,10 +223,12 @@ contract VibesTranchEscrow is ReentrancyGuard {
         if (_token == address(0)) revert ZeroAddress();
         if (_admin == address(0)) revert ZeroAddress();
         if (_platformWallet == address(0)) revert ZeroAddress();
+        if (_authorizedRouter == address(0)) revert ZeroAddress();
 
         admin = _admin;
         platformWallet = _platformWallet;
         timeOracle = _timeOracle;
+        authorizedRouter = _authorizedRouter;
 
         campaign = Campaign({
             founder: _founder,
@@ -265,7 +286,7 @@ contract VibesTranchEscrow is ReentrancyGuard {
     // ============ Finalization ============
 
     /// @notice Finalize the campaign after deadline
-    /// @dev Anyone can call this after deadline
+    /// @dev Anyone can call this after deadline. Calculates effective raised for pro-rata.
     function finalize() external nonReentrant {
         CampaignState state = campaign.state;
         if (state != CampaignState.Active && state != CampaignState.Paused) {
@@ -278,11 +299,34 @@ contract VibesTranchEscrow is ReentrancyGuard {
         if (success) {
             campaign.state = CampaignState.Funded;
             campaign.startTime = _currentTime();
+
+            // Calculate effective raised amount (handles pro-rata oversubscription)
+            _calculateEffectiveRaised();
+
             emit CampaignFunded(campaign.totalRaised, campaign.startTime);
         } else {
             campaign.state = CampaignState.Failed;
             emit CampaignFailed(campaign.totalRaised, campaign.goal);
         }
+    }
+
+    /// @notice Calculate effective raised amount, accounting for pro-rata excess
+    /// @dev For ProRata campaigns, effective = min(totalCommitted, goal)
+    ///      For others, effective = totalRaised
+    function _calculateEffectiveRaised() internal {
+        if (campaign.raiseType == RaiseType.ProRata) {
+            // For oversubscribed pro-rata, effective is capped at goal
+            if (campaign.totalCommitted > campaign.goal) {
+                effectiveRaised = campaign.goal;
+            } else {
+                effectiveRaised = campaign.totalCommitted;
+            }
+        } else {
+            effectiveRaised = campaign.totalRaised;
+        }
+
+        uint256 excessForRefunds = campaign.totalRaised - effectiveRaised;
+        emit CampaignFinalized(effectiveRaised, excessForRefunds);
     }
 
     function _checkFundingSuccess() internal view returns (bool) {
@@ -311,13 +355,19 @@ contract VibesTranchEscrow is ReentrancyGuard {
     /// @notice Get the amount for a specific tranche
     /// @param _tranche Tranche number (0 = kickstart, 1-6 = monthly)
     function getTrancheAmount(uint8 _tranche) public view returns (uint256) {
-        // Calculate escrow amount (80% of raised, 20% goes to LP)
-        uint256 escrowAmount = (campaign.totalRaised * 8000) / BPS_DENOMINATOR;
+        // Calculate escrow amount (80% of effective raised, 20% goes to LP)
+        // effectiveRaised accounts for pro-rata excess that stays for refunds
+        uint256 escrowAmount = (effectiveRaised * 8000) / BPS_DENOMINATOR;
 
         if (_tranche == 0) {
             return (escrowAmount * KICKSTART_BPS) / BPS_DENOMINATOR;
         }
         return (escrowAmount * MONTHLY_BPS) / BPS_DENOMINATOR;
+    }
+
+    /// @notice Get the amount of ETH designated for LP creation (20% of effective raised)
+    function getLPAmount() public view returns (uint256) {
+        return (effectiveRaised * 2000) / BPS_DENOMINATOR;
     }
 
     /// @notice Get total number of tranches (1 kickstart + 6 monthly)
@@ -334,11 +384,18 @@ contract VibesTranchEscrow is ReentrancyGuard {
         // Check no pending challenge
         if (activeChallenge.state == ChallengeState.Pending) revert ChallengePending();
 
+        // LP must be created before any tranches can be claimed
+        if (!lpWithdrawn) revert TrancheNotReady(_tranche, 0);
+
         uint256 unlockTime = getTrancheUnlockTime(_tranche);
         if (_currentTime() < unlockTime) revert TrancheNotReady(_tranche, unlockTime);
 
         // Must claim in order
         if (_tranche != campaign.nextTranche) revert TrancheNotReady(_tranche, unlockTime);
+
+        // Enforce 72-hour challenge window after unlock time
+        uint256 claimableTime = unlockTime + CHALLENGE_WINDOW;
+        if (_currentTime() < claimableTime) revert ChallengeWindowOpen();
 
         uint256 amount = getTrancheAmount(_tranche);
         uint256 fee = (amount * PLATFORM_FEE_BPS) / BPS_DENOMINATOR;
@@ -376,11 +433,39 @@ contract VibesTranchEscrow is ReentrancyGuard {
         if (activeChallenge.state == ChallengeState.Pending) {
             return (false, "Challenge pending");
         }
+        if (!lpWithdrawn) {
+            return (false, "LP not yet created");
+        }
         uint256 unlockTime = getTrancheUnlockTime(_tranche);
         if (_currentTime() < unlockTime) {
             return (false, "Not yet unlocked");
         }
+        // Check 72-hour challenge window has passed
+        uint256 claimableTime = unlockTime + CHALLENGE_WINDOW;
+        if (_currentTime() < claimableTime) {
+            return (false, "Challenge window still open");
+        }
         return (true, "");
+    }
+
+    // ============ LP Withdrawal ============
+
+    /// @notice Withdraw ETH for LP creation (called by authorized router only)
+    /// @param lpLocker Address of the LP locker contract to receive funds
+    /// @return amount Amount of ETH sent to LP locker
+    function withdrawForLP(address lpLocker) external nonReentrant returns (uint256 amount) {
+        if (msg.sender != authorizedRouter) revert OnlyRouter();
+        if (lpWithdrawn) revert LPAlreadyWithdrawn();
+        if (campaign.state != CampaignState.Funded) revert InvalidState(campaign.state, CampaignState.Funded);
+        if (lpLocker == address(0)) revert ZeroAddress();
+
+        lpWithdrawn = true;
+        amount = getLPAmount();
+
+        (bool success, ) = lpLocker.call{value: amount}("");
+        require(success, "LP transfer failed");
+
+        emit LPWithdrawn(lpLocker, amount);
     }
 
     // ============ Challenge Functions ============
@@ -428,9 +513,14 @@ contract VibesTranchEscrow is ReentrancyGuard {
         campaign.state = CampaignState.Frozen;
         campaign.snapshotBlock = block.number;
 
+        // Record frozen balances for holder refund calculations
+        frozenEthBalance = address(this).balance;
+        frozenTotalSupply = IERC20(campaign.token).totalSupply();
+
         // Return stake to challenger
         IERC20(campaign.token).safeTransfer(activeChallenge.challenger, activeChallenge.amount);
 
+        emit FrozenBalanceRecorded(frozenEthBalance, frozenTotalSupply);
         emit ChallengeUpheld(activeChallenge.challenger, uint8(activeChallenge.tranche));
         emit CampaignFrozen(msg.sender, "Challenge upheld");
     }
@@ -497,6 +587,12 @@ contract VibesTranchEscrow is ReentrancyGuard {
     function freezeCampaign(string calldata _reason) external onlyAdmin inState(CampaignState.Funded) {
         campaign.state = CampaignState.Frozen;
         campaign.snapshotBlock = block.number;
+
+        // Record frozen balances for holder refund calculations
+        frozenEthBalance = address(this).balance;
+        frozenTotalSupply = IERC20(campaign.token).totalSupply();
+
+        emit FrozenBalanceRecorded(frozenEthBalance, frozenTotalSupply);
         emit CampaignFrozen(msg.sender, _reason);
     }
 
@@ -552,14 +648,12 @@ contract VibesTranchEscrow is ReentrancyGuard {
 
         refundClaimedFromMerkle[msg.sender] = true;
 
-        // Calculate proportional ETH refund
-        IERC20 token = IERC20(campaign.token);
-        uint256 totalSupply = token.totalSupply();
-        uint256 ethBalance = address(this).balance;
-        uint256 ethRefund = (ethBalance * _tokenAmount) / totalSupply;
+        // Calculate proportional ETH refund using frozen snapshot values
+        // This ensures consistent refund amounts regardless of claim order
+        uint256 ethRefund = (frozenEthBalance * _tokenAmount) / frozenTotalSupply;
 
         // Burn tokens from holder (they must have approved this contract)
-        token.safeTransferFrom(msg.sender, address(0xdead), _tokenAmount);
+        IERC20(campaign.token).safeTransferFrom(msg.sender, address(0xdead), _tokenAmount);
 
         // Send ETH
         (bool success, ) = msg.sender.call{value: ethRefund}("");
@@ -646,5 +740,35 @@ contract VibesTranchEscrow is ReentrancyGuard {
 
     // ============ Receive ============
 
-    receive() external payable {}
+    /// @notice Accept direct ETH transfers as contributions only when valid
+    /// @dev Reverts if contribution cannot be properly recorded to prevent lost funds
+    receive() external payable {
+        // Only accept ETH if it can be recorded as a valid contribution
+        // This prevents users from accidentally losing funds
+        if (campaign.state != CampaignState.Active) {
+            revert InvalidState(campaign.state, CampaignState.Active);
+        }
+        if (_currentTime() >= campaign.deadline) {
+            revert CampaignEnded();
+        }
+        if (msg.value < MIN_CONTRIBUTION) {
+            revert BelowMinContribution();
+        }
+
+        // For FixedGoal, check hard cap
+        if (campaign.raiseType == RaiseType.FixedGoal && campaign.goal > 0) {
+            if (campaign.totalRaised + msg.value > campaign.goal) {
+                revert ExceedsHardCap();
+            }
+        }
+
+        contributions[msg.sender].amount += msg.value;
+        campaign.totalRaised += msg.value;
+
+        if (campaign.raiseType == RaiseType.ProRata) {
+            campaign.totalCommitted += msg.value;
+        }
+
+        emit ContributionMade(msg.sender, msg.value, campaign.totalRaised);
+    }
 }

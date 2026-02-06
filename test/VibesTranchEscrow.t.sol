@@ -7,11 +7,22 @@ import {VibesTranchEscrowFactory} from "../src/VibesTranchEscrowFactory.sol";
 import {MockTimeOracle} from "../src/MockTimeOracle.sol";
 import {VibesToken} from "../src/VibesToken.sol";
 
+// Mock router that implements completeFinalization
+contract MockRouter {
+    function completeFinalization(address) external {
+        // No-op for tests - in production this creates LP and distributor
+    }
+
+    // Accept ETH sent during finalize() (LP ETH forwarded from escrow)
+    receive() external payable {}
+}
+
 contract VibesTranchEscrowTest is Test {
     VibesTranchEscrow public implementation;
     VibesTranchEscrowFactory public factory;
     MockTimeOracle public timeOracle;
     VibesToken public token;
+    MockRouter public mockRouter;
 
     address public admin = makeAddr("admin");
     address public platformWallet = makeAddr("platform");
@@ -19,6 +30,7 @@ contract VibesTranchEscrowTest is Test {
     address public backer1 = makeAddr("backer1");
     address public backer2 = makeAddr("backer2");
     address public backer3 = makeAddr("backer3");
+    address public router;
 
     uint256 public constant GOAL = 10 ether;
     uint256 public constant SOFT_CAP = 5 ether;
@@ -29,6 +41,10 @@ contract VibesTranchEscrowTest is Test {
         vm.prank(admin);
         timeOracle = new MockTimeOracle();
 
+        // Deploy mock router that implements completeFinalization
+        mockRouter = new MockRouter();
+        router = address(mockRouter);
+
         // Deploy implementation
         implementation = new VibesTranchEscrow();
 
@@ -37,7 +53,9 @@ contract VibesTranchEscrowTest is Test {
             address(implementation),
             admin,
             platformWallet,
-            address(timeOracle)
+            address(timeOracle),
+            router, // authorizedRouter
+            makeAddr("lpLocker") // lpLocker
         );
 
         // Deploy token
@@ -58,13 +76,25 @@ contract VibesTranchEscrowTest is Test {
         uint256 softCap,
         uint256 deadline
     ) internal returns (VibesTranchEscrow) {
+        return _createEscrowWithStart(raiseType, goal, softCap, deadline, 0);
+    }
+
+    function _createEscrowWithStart(
+        VibesTranchEscrow.RaiseType raiseType,
+        uint256 goal,
+        uint256 softCap,
+        uint256 deadline,
+        uint256 raiseStart
+    ) internal returns (VibesTranchEscrow) {
+        vm.prank(router);
         address escrowAddr = factory.createEscrow(
             founder,
             address(token),
             raiseType,
             goal,
             softCap,
-            deadline
+            deadline,
+            raiseStart
         );
         return VibesTranchEscrow(payable(escrowAddr));
     }
@@ -104,7 +134,14 @@ contract VibesTranchEscrowTest is Test {
         vm.prank(admin);
         timeOracle.advanceDays(8);
 
+        // finalize() now sends LP ETH directly to the router during finalization
         escrow.finalize();
+    }
+
+    function _advancePastChallengeWindow() internal {
+        // Advance past the 72-hour challenge window
+        vm.prank(admin);
+        timeOracle.advanceTime(73 hours);
     }
 
     // ============ Initialization Tests ============
@@ -129,9 +166,12 @@ contract VibesTranchEscrowTest is Test {
             GOAL,
             0,
             block.timestamp + 7 days,
+            0, // raiseStart
             admin,
             platformWallet,
-            address(timeOracle)
+            address(timeOracle),
+            router,
+            makeAddr("lpLocker")
         );
     }
 
@@ -146,9 +186,12 @@ contract VibesTranchEscrowTest is Test {
             GOAL,
             0,
             block.timestamp + 7 days,
+            0, // raiseStart
             admin,
             platformWallet,
-            address(timeOracle)
+            address(timeOracle),
+            router,
+            makeAddr("lpLocker")
         );
     }
 
@@ -326,11 +369,26 @@ contract VibesTranchEscrowTest is Test {
     function test_FinalizeBeforeDeadline_Reverts() public {
         VibesTranchEscrow escrow = _createFixedGoalEscrow();
 
+        // Contribute less than goal - can't finalize early unless goal is reached
         vm.prank(backer1);
-        escrow.contribute{value: GOAL}();
+        escrow.contribute{value: GOAL - 1 ether}();
 
         vm.expectRevert(VibesTranchEscrow.CampaignNotEnded.selector);
         escrow.finalize();
+    }
+
+    function test_FinalizeEarly_WhenGoalReached() public {
+        VibesTranchEscrow escrow = _createFixedGoalEscrow();
+
+        // Contribute full goal - early finalization allowed
+        vm.prank(backer1);
+        escrow.contribute{value: GOAL}();
+
+        // Should succeed without waiting for deadline
+        escrow.finalize();
+
+        VibesTranchEscrow.Campaign memory campaign = escrow.getCampaign();
+        assertEq(uint8(campaign.state), uint8(VibesTranchEscrow.CampaignState.Funded));
     }
 
     // ============ Tranche Tests ============
@@ -338,6 +396,9 @@ contract VibesTranchEscrowTest is Test {
     function test_ClaimKickstartTranche() public {
         VibesTranchEscrow escrow = _createFixedGoalEscrow();
         _fundAndFinalize(escrow, GOAL);
+
+        // Must wait for challenge window to pass
+        _advancePastChallengeWindow();
 
         uint256 founderBalBefore = founder.balance;
         uint256 platformBalBefore = platformWallet.balance;
@@ -361,14 +422,16 @@ contract VibesTranchEscrowTest is Test {
         VibesTranchEscrow escrow = _createFixedGoalEscrow();
         _fundAndFinalize(escrow, GOAL);
 
-        // Claim kickstart (tranche 0)
+        // Wait for challenge window then claim kickstart (tranche 0)
+        _advancePastChallengeWindow();
         vm.prank(founder);
         escrow.claimTranche(0);
 
-        // Claim tranches 1-6 (monthly)
+        // Claim tranches 1-6 (monthly, each needs 30 days + 72hr challenge window)
         for (uint8 i = 1; i <= 6; i++) {
             vm.prank(admin);
             timeOracle.advanceDays(30);
+            _advancePastChallengeWindow();
 
             vm.prank(founder);
             escrow.claimTranche(i);
@@ -381,7 +444,8 @@ contract VibesTranchEscrowTest is Test {
         VibesTranchEscrow escrow = _createFixedGoalEscrow();
         _fundAndFinalize(escrow, GOAL);
 
-        // Claim kickstart first
+        // Claim kickstart first (after challenge window)
+        _advancePastChallengeWindow();
         vm.prank(founder);
         escrow.claimTranche(0);
 
@@ -401,6 +465,7 @@ contract VibesTranchEscrowTest is Test {
         // Try to skip kickstart and claim tranche 1
         vm.prank(admin);
         timeOracle.advanceDays(30);
+        _advancePastChallengeWindow();
 
         vm.prank(founder);
         vm.expectRevert();
@@ -411,6 +476,7 @@ contract VibesTranchEscrowTest is Test {
         VibesTranchEscrow escrow = _createFixedGoalEscrow();
         _fundAndFinalize(escrow, GOAL);
 
+        _advancePastChallengeWindow();
         vm.prank(founder);
         escrow.claimTranche(0);
 
@@ -426,6 +492,7 @@ contract VibesTranchEscrowTest is Test {
         VibesTranchEscrow escrow = _createFixedGoalEscrow();
         _fundAndFinalize(escrow, GOAL);
 
+        _advancePastChallengeWindow();
         vm.prank(backer1);
         vm.expectRevert(VibesTranchEscrow.OnlyFounder.selector);
         escrow.claimTranche(0);
@@ -437,8 +504,9 @@ contract VibesTranchEscrowTest is Test {
         VibesTranchEscrow escrow = _createFixedGoalEscrow();
         _fundAndFinalize(escrow, GOAL);
 
-        // Give backer1 enough tokens to challenge (0.5% of supply)
-        uint256 requiredTokens = (TOKEN_SUPPLY * 50) / 10000;
+        // Give backer1 enough tokens to challenge (0.25% for tranche 0 - graduated threshold)
+        uint256 thresholdBps = escrow.getChallengeThreshold(0); // 25 bps = 0.25%
+        uint256 requiredTokens = (TOKEN_SUPPLY * thresholdBps) / 10000;
         vm.prank(founder);
         token.transfer(backer1, requiredTokens);
 
@@ -448,7 +516,7 @@ contract VibesTranchEscrowTest is Test {
 
         // Raise challenge
         vm.prank(backer1);
-        escrow.raiseChallenge();
+        escrow.raiseChallenge("Test challenge reason");
 
         VibesTranchEscrow.Challenge memory challenge = escrow.getActiveChallenge();
         assertEq(challenge.challenger, backer1);
@@ -460,8 +528,9 @@ contract VibesTranchEscrowTest is Test {
         VibesTranchEscrow escrow = _createFixedGoalEscrow();
         _fundAndFinalize(escrow, GOAL);
 
-        // Give backer1 less than required
-        uint256 requiredTokens = (TOKEN_SUPPLY * 50) / 10000;
+        // Give backer1 less than required (0.25% for tranche 0)
+        uint256 thresholdBps = escrow.getChallengeThreshold(0);
+        uint256 requiredTokens = (TOKEN_SUPPLY * thresholdBps) / 10000;
         vm.prank(founder);
         token.transfer(backer1, requiredTokens - 1);
 
@@ -470,21 +539,22 @@ contract VibesTranchEscrowTest is Test {
 
         vm.prank(backer1);
         vm.expectRevert(VibesTranchEscrow.InsufficientTokensToChallenge.selector);
-        escrow.raiseChallenge();
+        escrow.raiseChallenge("Test challenge reason");
     }
 
     function test_ChallengeBlocksTrancheClaim() public {
         VibesTranchEscrow escrow = _createFixedGoalEscrow();
         _fundAndFinalize(escrow, GOAL);
 
-        // Setup and raise challenge
-        uint256 requiredTokens = (TOKEN_SUPPLY * 50) / 10000;
+        // Setup and raise challenge (0.25% for tranche 0)
+        uint256 thresholdBps = escrow.getChallengeThreshold(0);
+        uint256 requiredTokens = (TOKEN_SUPPLY * thresholdBps) / 10000;
         vm.prank(founder);
         token.transfer(backer1, requiredTokens);
         vm.prank(backer1);
         token.approve(address(escrow), requiredTokens);
         vm.prank(backer1);
-        escrow.raiseChallenge();
+        escrow.raiseChallenge("Test challenge reason");
 
         // Founder tries to claim
         vm.prank(founder);
@@ -496,20 +566,22 @@ contract VibesTranchEscrowTest is Test {
         VibesTranchEscrow escrow = _createFixedGoalEscrow();
         _fundAndFinalize(escrow, GOAL);
 
-        // Setup challenge
-        uint256 requiredTokens = (TOKEN_SUPPLY * 50) / 10000;
+        // Setup challenge (0.25% for tranche 0)
+        uint256 thresholdBps = escrow.getChallengeThreshold(0);
+        uint256 requiredTokens = (TOKEN_SUPPLY * thresholdBps) / 10000;
         vm.prank(founder);
         token.transfer(backer1, requiredTokens);
         vm.prank(backer1);
         token.approve(address(escrow), requiredTokens);
         vm.prank(backer1);
-        escrow.raiseChallenge();
+        escrow.raiseChallenge("Test challenge reason");
 
         uint256 backerBalBefore = token.balanceOf(backer1);
 
-        // Admin upholds
+        // Admin upholds (pass empty exclude addresses for test)
+        address[] memory excludeAddresses = new address[](0);
         vm.prank(admin);
-        escrow.upholdChallenge();
+        escrow.upholdChallenge(excludeAddresses);
 
         VibesTranchEscrow.Campaign memory campaign = escrow.getCampaign();
         assertEq(uint8(campaign.state), uint8(VibesTranchEscrow.CampaignState.Frozen));
@@ -522,14 +594,15 @@ contract VibesTranchEscrowTest is Test {
         VibesTranchEscrow escrow = _createFixedGoalEscrow();
         _fundAndFinalize(escrow, GOAL);
 
-        // Setup challenge
-        uint256 requiredTokens = (TOKEN_SUPPLY * 50) / 10000;
+        // Setup challenge (0.25% for tranche 0)
+        uint256 thresholdBps = escrow.getChallengeThreshold(0);
+        uint256 requiredTokens = (TOKEN_SUPPLY * thresholdBps) / 10000;
         vm.prank(founder);
         token.transfer(backer1, requiredTokens);
         vm.prank(backer1);
         token.approve(address(escrow), requiredTokens);
         vm.prank(backer1);
-        escrow.raiseChallenge();
+        escrow.raiseChallenge("Test challenge reason");
 
         // Admin rejects
         vm.prank(admin);
@@ -548,14 +621,15 @@ contract VibesTranchEscrowTest is Test {
         VibesTranchEscrow escrow = _createFixedGoalEscrow();
         _fundAndFinalize(escrow, GOAL);
 
-        // Setup challenge
-        uint256 requiredTokens = (TOKEN_SUPPLY * 50) / 10000;
+        // Setup challenge (0.25% for tranche 0)
+        uint256 thresholdBps = escrow.getChallengeThreshold(0);
+        uint256 requiredTokens = (TOKEN_SUPPLY * thresholdBps) / 10000;
         vm.prank(founder);
         token.transfer(backer1, requiredTokens);
         vm.prank(backer1);
         token.approve(address(escrow), requiredTokens);
         vm.prank(backer1);
-        escrow.raiseChallenge();
+        escrow.raiseChallenge("Test challenge reason");
 
         // Wait 73 hours (past 72hr window)
         vm.prank(admin);
@@ -720,8 +794,9 @@ contract VibesTranchEscrowTest is Test {
         VibesTranchEscrow escrow = _createFixedGoalEscrow();
         _fundAndFinalize(escrow, GOAL);
 
+        address[] memory excludeAddresses = new address[](0);
         vm.prank(admin);
-        escrow.freezeCampaign("Project abandoned");
+        escrow.freezeCampaign("Project abandoned", excludeAddresses);
 
         VibesTranchEscrow.Campaign memory campaign = escrow.getCampaign();
         assertEq(uint8(campaign.state), uint8(VibesTranchEscrow.CampaignState.Frozen));
@@ -810,20 +885,205 @@ contract VibesTranchEscrowTest is Test {
         vm.prank(admin);
         timeOracle.advanceDays(8);
 
+        // finalize() now sends LP ETH directly to the router
         escrow.finalize();
 
-        // Founder claims all tranches
+        // Founder claims all tranches (must wait for challenge window each time)
+        _advancePastChallengeWindow();
         vm.prank(founder);
         escrow.claimTranche(0);
 
         for (uint8 i = 1; i <= 6; i++) {
             vm.prank(admin);
             timeOracle.advanceDays(30);
+            _advancePastChallengeWindow();
 
             vm.prank(founder);
             escrow.claimTranche(i);
         }
 
         assertTrue(escrow.allTranchesClaimed());
+    }
+
+    // ============ Challenge Window Tests ============
+
+    function test_ClaimTrancheBeforeChallengeWindowEnds_Reverts() public {
+        VibesTranchEscrow escrow = _createFixedGoalEscrow();
+        _fundAndFinalize(escrow, GOAL);
+
+        // Don't advance past challenge window
+        vm.prank(founder);
+        vm.expectRevert(VibesTranchEscrow.ChallengeWindowOpen.selector);
+        escrow.claimTranche(0);
+    }
+
+    // ============ LP ETH Tests ============
+
+    function test_LPEthSentDuringFinalize() public {
+        VibesTranchEscrow escrow = _createFixedGoalEscrow();
+
+        vm.prank(backer1);
+        escrow.contribute{value: GOAL}();
+
+        uint256 routerBalBefore = router.balance;
+
+        vm.prank(admin);
+        timeOracle.advanceDays(8);
+
+        escrow.finalize();
+
+        // LP ETH should have been sent to the router during finalize
+        uint256 lpEthSent = escrow.getLPEthSent();
+        assertGt(lpEthSent, 0);
+        assertEq(router.balance - routerBalBefore, lpEthSent);
+        assertTrue(escrow.lpWithdrawn());
+    }
+
+    function test_LPEthSent_FailedRaise_NoLP() public {
+        VibesTranchEscrow escrow = _createFixedGoalEscrow();
+
+        // Contribute less than goal
+        vm.prank(backer1);
+        escrow.contribute{value: GOAL - 1 ether}();
+
+        vm.prank(admin);
+        timeOracle.advanceDays(8);
+
+        escrow.finalize();
+
+        // Failed raise should not send LP ETH
+        assertEq(escrow.getLPEthSent(), 0);
+        assertFalse(escrow.lpWithdrawn());
+    }
+
+    // ============ Scheduled Raise Tests ============
+
+    function test_ScheduledRaise_ContributeBeforeStart_Reverts() public {
+        // Create escrow with raiseStart 3 days from now
+        uint256 raiseStart = block.timestamp + 3 days;
+        VibesTranchEscrow escrow = _createEscrowWithStart(
+            VibesTranchEscrow.RaiseType.FixedGoal,
+            GOAL,
+            0,
+            raiseStart + 7 days, // deadline relative to raiseStart
+            raiseStart
+        );
+
+        // Try to contribute before raiseStart
+        vm.prank(backer1);
+        vm.expectRevert(VibesTranchEscrow.RaiseNotStarted.selector);
+        escrow.contribute{value: 1 ether}();
+    }
+
+    function test_ScheduledRaise_ContributeAfterStart_Succeeds() public {
+        uint256 raiseStart = block.timestamp + 3 days;
+        VibesTranchEscrow escrow = _createEscrowWithStart(
+            VibesTranchEscrow.RaiseType.FixedGoal,
+            GOAL,
+            0,
+            raiseStart + 7 days,
+            raiseStart
+        );
+
+        // Advance past raiseStart
+        vm.prank(admin);
+        timeOracle.advanceDays(4);
+
+        // Should succeed now
+        vm.prank(backer1);
+        escrow.contribute{value: 1 ether}();
+
+        VibesTranchEscrow.Contribution memory contrib = escrow.getContribution(backer1);
+        assertEq(contrib.amount, 1 ether);
+    }
+
+    function test_ScheduledRaise_IsRaiseStarted_View() public {
+        uint256 raiseStart = block.timestamp + 3 days;
+        VibesTranchEscrow escrow = _createEscrowWithStart(
+            VibesTranchEscrow.RaiseType.FixedGoal,
+            GOAL,
+            0,
+            raiseStart + 7 days,
+            raiseStart
+        );
+
+        // Before start
+        assertFalse(escrow.isRaiseStarted());
+
+        // After start
+        vm.prank(admin);
+        timeOracle.advanceDays(4);
+        assertTrue(escrow.isRaiseStarted());
+    }
+
+    function test_ImmediateRaise_IsRaiseStarted_AlwaysTrue() public {
+        VibesTranchEscrow escrow = _createFixedGoalEscrow();
+        assertTrue(escrow.isRaiseStarted());
+    }
+
+    // ============ Graduated Challenge Threshold Tests ============
+
+    function test_GraduatedThresholds_Values() public {
+        VibesTranchEscrow escrow = _createFixedGoalEscrow();
+        // Early tranches: 0.25%
+        assertEq(escrow.getChallengeThreshold(0), 25);
+        assertEq(escrow.getChallengeThreshold(1), 25);
+        assertEq(escrow.getChallengeThreshold(2), 25);
+        // Mid tranches: 0.50%
+        assertEq(escrow.getChallengeThreshold(3), 50);
+        assertEq(escrow.getChallengeThreshold(4), 50);
+        // Late tranches: 1.00%
+        assertEq(escrow.getChallengeThreshold(5), 100);
+        assertEq(escrow.getChallengeThreshold(6), 100);
+    }
+
+    // ============ Founder Update Tests ============
+
+    function test_FounderCanPostUpdate() public {
+        VibesTranchEscrow escrow = _createFixedGoalEscrow();
+        _fundAndFinalize(escrow, GOAL);
+
+        vm.prank(founder);
+        escrow.postUpdate("QmTestCid123");
+        // If no revert, it succeeded. Event emission tested implicitly.
+    }
+
+    function test_NonFounderCannotPostUpdate() public {
+        VibesTranchEscrow escrow = _createFixedGoalEscrow();
+        _fundAndFinalize(escrow, GOAL);
+
+        vm.prank(backer1);
+        vm.expectRevert(VibesTranchEscrow.OnlyFounder.selector);
+        escrow.postUpdate("QmTestCid123");
+    }
+
+    function test_CannotPostUpdateDuringActiveRaise() public {
+        VibesTranchEscrow escrow = _createFixedGoalEscrow();
+
+        vm.prank(founder);
+        vm.expectRevert();
+        escrow.postUpdate("QmTestCid123");
+    }
+
+    function test_CanPostUpdateWhenCompleted() public {
+        VibesTranchEscrow escrow = _createFixedGoalEscrow();
+        _fundAndFinalize(escrow, GOAL);
+
+        // Claim all tranches to complete
+        _advancePastChallengeWindow();
+        vm.prank(founder);
+        escrow.claimTranche(0);
+
+        for (uint8 i = 1; i <= 6; i++) {
+            vm.prank(admin);
+            timeOracle.advanceDays(30);
+            _advancePastChallengeWindow();
+            vm.prank(founder);
+            escrow.claimTranche(i);
+        }
+
+        // Now completed — update should still work
+        vm.prank(founder);
+        escrow.postUpdate("QmCompletedUpdate");
     }
 }

@@ -72,6 +72,9 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
     /// @notice Total ETH refunds claimed so far
     uint256 public totalEthClaimed;
 
+    /// @notice ETH owed to recipients from failed transfers during batchDistribute
+    mapping(address => uint256) public pendingEthRefunds;
+
     // ============================================
     // ERRORS
     // ============================================
@@ -87,6 +90,7 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
     error TransferFailed();
     error InsufficientEth();
     error SweepTooEarly();
+    error NoPendingEth();
 
     // ============================================
     // CONSTRUCTOR
@@ -206,7 +210,8 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
 
     /**
      * @notice Batch distribute tokens + ETH (founder pays gas)
-     * @dev If ETH transfer fails, the recipient is NOT marked as claimed for ETH portion
+     * @dev Always marks recipient as claimed after tokens are sent. If ETH transfer fails,
+     *      the owed ETH is tracked in pendingEthRefunds for the recipient to claim via claimPendingEth().
      * @param recipients Array of recipient addresses
      * @param tokenAmounts Array of token amounts
      * @param ethRefunds Array of ETH refund amounts
@@ -236,43 +241,51 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
             bytes32 leaf = keccak256(abi.encodePacked(recipient, tokenAmount, ethRefund));
             if (!MerkleProof.verify(proofs[i], merkleRoot, leaf)) continue;
 
-            // Track actual amounts distributed
-            uint256 actualTokens = 0;
-            uint256 actualEth = 0;
+            // Always mark as claimed FIRST to prevent double-claim
+            hasClaimed[recipient] = true;
 
             // Transfer tokens
             if (tokenAmount > 0) {
-                actualTokens = tokenAmount;
                 totalTokensClaimed += tokenAmount;
                 token.safeTransfer(recipient, tokenAmount);
             }
 
             // Transfer ETH refund
+            uint256 actualEth = 0;
             if (ethRefund > 0 && address(this).balance >= ethRefund) {
                 (bool sent, ) = recipient.call{value: ethRefund}("");
                 if (sent) {
                     actualEth = ethRefund;
                     totalEthClaimed += ethRefund;
+                } else {
+                    // ETH transfer failed - track for pull-based claim
+                    pendingEthRefunds[recipient] = ethRefund;
                 }
-                // If ETH transfer fails, don't mark as claimed so they can retry via claim()
+            } else if (ethRefund > 0) {
+                // Insufficient ETH balance - track for pull-based claim
+                pendingEthRefunds[recipient] = ethRefund;
             }
 
-            // Only mark as fully claimed if everything was distributed
-            // If ETH transfer failed, they can still call claim() to get their ETH
-            if (actualTokens == tokenAmount && actualEth == ethRefund) {
-                hasClaimed[recipient] = true;
-            } else if (actualTokens > 0 && actualEth < ethRefund) {
-                // Partial claim: tokens sent but ETH failed
-                // Don't mark as claimed - they need to call claim() for ETH
-                // Note: This means they'll need to re-verify, but tokens won't double-send
-                // because safeTransfer would fail if balance insufficient
-            } else if (actualTokens == tokenAmount && ethRefund == 0) {
-                // No ETH to send, tokens sent successfully
-                hasClaimed[recipient] = true;
-            }
-
-            emit TokensClaimed(recipient, actualTokens, actualEth);
+            emit TokensClaimed(recipient, tokenAmount, actualEth);
         }
+    }
+
+    /**
+     * @notice Claim pending ETH refund from a failed batch distribution
+     * @dev For recipients whose ETH transfer failed during batchDistribute
+     */
+    function claimPendingEth() external nonReentrant {
+        uint256 owed = pendingEthRefunds[msg.sender];
+        if (owed == 0) revert NoPendingEth();
+        if (address(this).balance < owed) revert InsufficientEth();
+
+        pendingEthRefunds[msg.sender] = 0;
+        totalEthClaimed += owed;
+
+        (bool sent, ) = msg.sender.call{value: owed}("");
+        if (!sent) revert TransferFailed();
+
+        emit TokensClaimed(msg.sender, 0, owed);
     }
 
     // ============================================

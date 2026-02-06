@@ -6,8 +6,9 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
 
 /**
  * @title VibesVesting
- * @notice Linear vesting contract for founder token allocations.
+ * @notice Linear vesting contract for founder token allocations with optional cliff.
  * @dev Tokens vest linearly over a specified duration (default 12 months).
+ *      Optional cliff period: no tokens vest until cliff passes, then linear from start.
  *      Founder can claim vested tokens at any time via release().
  */
 contract VibesVesting is ReentrancyGuard {
@@ -29,11 +30,18 @@ contract VibesVesting is ReentrancyGuard {
     /// @notice The beneficiary who receives vested tokens
     address public immutable beneficiary;
 
+    /// @notice The address authorized to start vesting (typically the router)
+    address public immutable authorizedStarter;
+
     /// @notice Timestamp when vesting starts (set when campaign is funded)
     uint256 public start;
 
     /// @notice Duration of vesting in seconds
     uint256 public immutable duration;
+
+    /// @notice Cliff period in seconds (0 = no cliff)
+    /// @dev No tokens are releasable until start + cliff. After cliff, vesting is linear from start.
+    uint256 public immutable cliff;
 
     /// @notice Total amount of tokens to vest
     uint256 public totalAmount;
@@ -52,21 +60,26 @@ contract VibesVesting is ReentrancyGuard {
      * @param _token Token to vest
      * @param _beneficiary Address that will receive vested tokens
      * @param _duration Vesting duration in seconds (e.g., 365 days for 1 year)
+     * @param _cliff Cliff period in seconds (0 = no cliff, e.g., 90 days)
      */
     constructor(
         address _token,
         address _beneficiary,
-        uint256 _duration
+        uint256 _duration,
+        uint256 _cliff
     ) {
         require(_token != address(0), "Invalid token");
         require(_beneficiary != address(0), "Invalid beneficiary");
         require(_duration > 0, "Invalid duration");
+        require(_cliff <= _duration, "Cliff exceeds duration");
 
         token = IERC20(_token);
         beneficiary = _beneficiary;
+        authorizedStarter = msg.sender; // The router that deploys this contract
         // start is NOT set here - it's set when startVesting() is called
         // This ensures vesting begins when campaign is funded, not at deployment
         duration = _duration;
+        cliff = _cliff;
     }
 
     // ============================================
@@ -92,10 +105,12 @@ contract VibesVesting is ReentrancyGuard {
 
     /**
      * @notice Start the vesting clock
-     * @dev Should be called when campaign reaches Funded state.
+     * @dev Only callable by the authorized starter (the router that deployed this contract).
+     *      Should be called when raise reaches Funded state.
      *      Can only be called once. If not called, vesting never starts.
      */
     function startVesting() external {
+        require(msg.sender == authorizedStarter, "Only authorized starter");
         require(initialized, "Not initialized");
         require(start == 0, "Vesting already started");
 
@@ -130,12 +145,14 @@ contract VibesVesting is ReentrancyGuard {
 
     /**
      * @notice Calculate amount of tokens that have vested
+     * @dev If cliff is set, returns 0 until cliff passes. After cliff, linear from start.
      * @return Amount of vested tokens (may include already released)
      */
     function vestedAmount() public view returns (uint256) {
         if (!initialized) return 0;
         if (start == 0) return 0; // Vesting hasn't started yet
         if (block.timestamp < start) return 0;
+        if (block.timestamp < start + cliff) return 0; // Before cliff: nothing vested
         if (block.timestamp >= start + duration) return totalAmount;
 
         return (totalAmount * (block.timestamp - start)) / duration;
@@ -155,6 +172,7 @@ contract VibesVesting is ReentrancyGuard {
      */
     function vestingProgress() external view returns (uint256) {
         if (!initialized) return 0;
+        if (start == 0) return 0; // Vesting hasn't started yet
         if (block.timestamp >= start + duration) return 10000;
 
         return ((block.timestamp - start) * 10000) / duration;
@@ -174,6 +192,7 @@ contract VibesVesting is ReentrancyGuard {
      * @notice Get vesting schedule details
      * @return _start Start timestamp
      * @return _duration Duration in seconds
+     * @return _cliff Cliff period in seconds
      * @return _totalAmount Total tokens to vest
      * @return _released Tokens already released
      * @return _releasable Tokens available to release now
@@ -181,10 +200,11 @@ contract VibesVesting is ReentrancyGuard {
     function getVestingSchedule() external view returns (
         uint256 _start,
         uint256 _duration,
+        uint256 _cliff,
         uint256 _totalAmount,
         uint256 _released,
         uint256 _releasable
     ) {
-        return (start, duration, totalAmount, released, releasable());
+        return (start, duration, cliff, totalAmount, released, releasable());
     }
 }

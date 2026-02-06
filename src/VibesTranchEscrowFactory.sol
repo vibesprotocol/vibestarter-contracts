@@ -26,6 +26,9 @@ contract VibesTranchEscrowFactory {
     /// @notice Authorized router for LP withdrawals
     address public authorizedRouter;
 
+    /// @notice LP locker address
+    address public lpLocker;
+
     /// @notice All deployed escrows
     address[] public escrows;
 
@@ -51,15 +54,33 @@ contract VibesTranchEscrowFactory {
     event TimeOracleUpdated(address indexed oldOracle, address indexed newOracle);
     event AuthorizedRouterUpdated(address indexed oldRouter, address indexed newRouter);
 
+    // ============ Constants ============
+
+    /// @notice Maximum raise duration (30 days of active fundraising)
+    uint256 public constant MAX_RAISE_DURATION = 30 days;
+
+    /// @notice Maximum scheduling window (raise can start up to 30 days from now)
+    uint256 public constant MAX_SCHEDULE_WINDOW = 30 days;
+
     // ============ Errors ============
 
     error OnlyAdmin();
+    error OnlyRouter();
     error ZeroAddress();
+    error DeadlineInPast();
+    error DeadlineTooFar();
+    error RaiseStartInPast();
+    error RaiseStartTooFar();
 
     // ============ Modifiers ============
 
     modifier onlyAdmin() {
         if (msg.sender != admin) revert OnlyAdmin();
+        _;
+    }
+
+    modifier onlyRouter() {
+        if (msg.sender != authorizedRouter) revert OnlyRouter();
         _;
     }
 
@@ -70,23 +91,27 @@ contract VibesTranchEscrowFactory {
     /// @param _platformWallet Platform fee wallet
     /// @param _timeOracle Time oracle (0x0 for production)
     /// @param _authorizedRouter Router authorized for LP withdrawals
+    /// @param _lpLocker LP locker address
     constructor(
         address _implementation,
         address _admin,
         address _platformWallet,
         address _timeOracle,
-        address _authorizedRouter
+        address _authorizedRouter,
+        address _lpLocker
     ) {
         if (_implementation == address(0)) revert ZeroAddress();
         if (_admin == address(0)) revert ZeroAddress();
         if (_platformWallet == address(0)) revert ZeroAddress();
         if (_authorizedRouter == address(0)) revert ZeroAddress();
+        if (_lpLocker == address(0)) revert ZeroAddress();
 
         implementation = _implementation;
         admin = _admin;
         platformWallet = _platformWallet;
         timeOracle = _timeOracle;
         authorizedRouter = _authorizedRouter;
+        lpLocker = _lpLocker;
     }
 
     // ============ Factory Functions ============
@@ -98,6 +123,7 @@ contract VibesTranchEscrowFactory {
     /// @param _goal Funding goal (hard cap for ProRata, required for FixedGoal, 0 for OpenEnded)
     /// @param _softCap Soft cap (optional, only for OpenEnded)
     /// @param _deadline Campaign deadline
+    /// @param _raiseStart When contributions begin (0 = immediate)
     /// @return escrow Address of the new escrow
     function createEscrow(
         address _founder,
@@ -105,8 +131,20 @@ contract VibesTranchEscrowFactory {
         VibesTranchEscrow.RaiseType _raiseType,
         uint256 _goal,
         uint256 _softCap,
-        uint256 _deadline
-    ) external returns (address escrow) {
+        uint256 _deadline,
+        uint256 _raiseStart
+    ) external onlyRouter returns (address escrow) {
+        // Validate raiseStart
+        uint256 effectiveStart = _raiseStart == 0 ? block.timestamp : _raiseStart;
+        if (_raiseStart != 0) {
+            if (_raiseStart < block.timestamp) revert RaiseStartInPast();
+            if (_raiseStart > block.timestamp + MAX_SCHEDULE_WINDOW) revert RaiseStartTooFar();
+        }
+
+        // Validate deadline relative to effective start
+        if (_deadline <= effectiveStart) revert DeadlineInPast();
+        if (_deadline > effectiveStart + MAX_RAISE_DURATION) revert DeadlineTooFar();
+
         // Create deterministic clone
         bytes32 salt = keccak256(abi.encodePacked(_founder, _token, _deadline, escrows.length));
         escrow = implementation.cloneDeterministic(salt);
@@ -119,10 +157,12 @@ contract VibesTranchEscrowFactory {
             _goal,
             _softCap,
             _deadline,
+            _raiseStart,
             admin,
             platformWallet,
             timeOracle,
-            authorizedRouter
+            authorizedRouter,
+            lpLocker
         );
 
         // Track the escrow
@@ -175,6 +215,12 @@ contract VibesTranchEscrowFactory {
         address oldRouter = authorizedRouter;
         authorizedRouter = _newRouter;
         emit AuthorizedRouterUpdated(oldRouter, _newRouter);
+    }
+
+    /// @notice Update LP locker address
+    function setLPLocker(address _newLPLocker) external onlyAdmin {
+        if (_newLPLocker == address(0)) revert ZeroAddress();
+        lpLocker = _newLPLocker;
     }
 
     // ============ View Functions ============

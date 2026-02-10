@@ -12,6 +12,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
+import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 
 /**
  * @title VibesLaunchRouterV2
@@ -23,7 +24,7 @@ import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
  *      - Dynamic token allocation: Backers 80% * (1-founderAlloc), LP 20% * (1-founderAlloc), Founder 0-10%
  *      - LP price matches raise price
  */
-contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable {
+contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable, Ownable2Step {
     using SafeERC20 for IERC20;
 
     // ============================================
@@ -105,12 +106,6 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable {
         uint256 amount
     );
 
-    event DepositReadyForClaim(
-        address indexed founder,
-        address indexed token,
-        uint256 amount
-    );
-
     // ============================================
     // CONSTANTS
     // ============================================
@@ -145,9 +140,6 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable {
 
     /// @notice LP locker contract
     VibesLPLocker public lpLocker;
-
-    /// @notice Owner address for admin functions
-    address public owner;
 
     /// @notice Fee settings
     bool public feesEnabled;
@@ -189,14 +181,10 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable {
     /// @notice Track whether a backer has claimed tokens for a specific campaign
     mapping(address => mapping(address => bool)) public hasClaimedTokens; // token => backer => claimed
 
-    /// @notice Claimable deposit refunds for founders (pull-based pattern)
-    mapping(address => uint256) public claimableDeposits; // founder => amount
-
     // ============================================
     // ERRORS
     // ============================================
 
-    error OnlyOwner();
     error ZeroAddress();
     error InvalidAllocation();
     error CampaignNotFunded();
@@ -215,17 +203,7 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable {
     error NotABacker();
     error NothingToClaim();
     error CampaignNotReady();
-    error NoClaimableDeposit();
     error TooManyTokens();
-
-    // ============================================
-    // MODIFIERS
-    // ============================================
-
-    modifier onlyOwner() {
-        if (msg.sender != owner) revert OnlyOwner();
-        _;
-    }
 
     // ============================================
     // CONSTRUCTOR
@@ -236,7 +214,7 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable {
         address _registry,
         address _escrowFactory,
         address payable _lpLocker
-    ) {
+    ) Ownable(msg.sender) {
         if (_tokenFactory == address(0)) revert ZeroAddress();
         if (_registry == address(0)) revert ZeroAddress();
 
@@ -250,7 +228,6 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable {
             lpLocker = VibesLPLocker(_lpLocker);
         }
 
-        owner = msg.sender;
         feeRecipient = msg.sender;
     }
 
@@ -447,12 +424,16 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable {
             VibesVesting(vestingAddr).startVesting();
         }
 
-        // Make founder deposit claimable (pull-based)
+        // Auto-refund founder deposit on successful raise
         uint256 depositAmount = tokenDeposits[token];
         if (depositAmount > 0) {
             delete tokenDeposits[token];
-            claimableDeposits[campaign.founder] += depositAmount;
-            emit DepositReadyForClaim(campaign.founder, token, depositAmount);
+            (bool sent, ) = campaign.founder.call{value: depositAmount}("");
+            if (sent) {
+                emit DepositRefunded(campaign.founder, token, depositAmount);
+            }
+            // Note: If refund fails, deposit stays in contract for manual recovery
+            // This prevents blocking finalization due to founder wallet issues
         }
 
         emit LPCreated(token, pool, lpData.tokenAmount, ethForLP, lpAmount);
@@ -496,7 +477,7 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable {
             campaign.founder,
             escrowAddr,
             opsWallet,
-            owner
+            owner()
         );
         distributor = address(newDistributor);
         tokenToDistributor[token] = distributor;
@@ -579,14 +560,16 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable {
         uint256 routerBalance = IERC20(token).balanceOf(address(this));
         backerTokensForClaims[token] = routerBalance;
 
-        // === Step 4: Make founder deposit claimable (pull-based) ===
-        // Deposit is not sent during finalization to avoid untrusted external calls
-        // Founder can claim via claimDepositRefund() in a separate transaction
+        // === Step 4: Auto-refund founder deposit on successful raise ===
         uint256 depositAmount = tokenDeposits[token];
         if (depositAmount > 0) {
             delete tokenDeposits[token];
-            claimableDeposits[campaign.founder] += depositAmount;
-            emit DepositReadyForClaim(campaign.founder, token, depositAmount);
+            (bool sent, ) = campaign.founder.call{value: depositAmount}("");
+            if (sent) {
+                emit DepositRefunded(campaign.founder, token, depositAmount);
+            }
+            // Note: If refund fails, deposit stays in contract for manual recovery
+            // This prevents blocking finalization due to founder wallet issues
         }
     }
 
@@ -731,7 +714,10 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable {
         // If not finalized yet, estimate based on pending LP data
         if (totalBackerTokens == 0) {
             PendingLP memory lpData = pendingLP[token];
-            totalBackerTokens = IERC20(token).balanceOf(address(this)) - lpData.tokenAmount;
+            uint256 routerBalance = IERC20(token).balanceOf(address(this));
+            uint256 reserved = lpData.tokenAmount + lpData.stakerAllocation;
+            if (routerBalance < reserved) return 0;
+            totalBackerTokens = routerBalance - reserved;
         }
 
         if (effectiveRaised == 0) {
@@ -824,34 +810,8 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable {
     }
 
     // ============================================
-    // DEPOSIT CLAIM
-    // ============================================
-
-    /**
-     * @notice Claim deposit refund after successful raise finalization
-     * @dev Pull-based pattern: founder calls this to receive their deposit back.
-     *      Separates the deposit refund from the critical finalization chain.
-     */
-    function claimDepositRefund() external nonReentrant {
-        uint256 amount = claimableDeposits[msg.sender];
-        if (amount == 0) revert NoClaimableDeposit();
-
-        claimableDeposits[msg.sender] = 0;
-
-        (bool sent, ) = msg.sender.call{value: amount}("");
-        if (!sent) revert RefundFailed();
-
-        emit DepositRefunded(msg.sender, address(0), amount);
-    }
-
-    // ============================================
     // ADMIN FUNCTIONS
     // ============================================
-
-    function transferOwnership(address newOwner) external onlyOwner {
-        if (newOwner == address(0)) revert ZeroAddress();
-        owner = newOwner;
-    }
 
     /// @notice Emergency pause - stops launches, claims, and finalization
     function pause() external onlyOwner {
@@ -975,6 +935,22 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable {
      */
     function getDepositRequirement() external view returns (uint256) {
         return founderDepositWei;
+    }
+
+    // ============================================
+    // RESCUE
+    // ============================================
+
+    event ETHRescued(address indexed to, uint256 amount);
+
+    /// @notice Rescue accidentally sent ETH from the router
+    /// @param to Recipient address
+    /// @param amount Amount of ETH to rescue
+    function rescueETH(address to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+        (bool success, ) = to.call{value: amount}("");
+        require(success, "ETH transfer failed");
+        emit ETHRescued(to, amount);
     }
 
     // ============================================

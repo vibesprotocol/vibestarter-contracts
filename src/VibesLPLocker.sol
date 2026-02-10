@@ -48,6 +48,12 @@ contract VibesLPLocker is ReentrancyGuard {
     /// @notice Whether a campaign has locked LP
     mapping(address => bool) public hasLockedLP;
 
+    /// @notice Contract owner
+    address public owner;
+
+    /// @notice Authorized router for LP creation
+    address public authorizedRouter;
+
     // ============ Events ============
 
     event LPCreatedAndLocked(
@@ -67,6 +73,20 @@ contract VibesLPLocker is ReentrancyGuard {
     error InsufficientETH();
     error LPCreationFailed();
     error AlreadyLocked();
+    error OnlyOwner();
+    error OnlyRouter();
+
+    // ============ Modifiers ============
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert OnlyOwner();
+        _;
+    }
+
+    modifier onlyRouter() {
+        if (msg.sender != authorizedRouter) revert OnlyRouter();
+        _;
+    }
 
     // ============ Constructor ============
 
@@ -77,6 +97,7 @@ contract VibesLPLocker is ReentrancyGuard {
         if (_factory == address(0)) revert ZeroAddress();
         aerodromeRouter = _router;
         aerodromeFactory = _factory;
+        owner = msg.sender;
     }
 
     // ============ Main Functions ============
@@ -91,7 +112,7 @@ contract VibesLPLocker is ReentrancyGuard {
         address _token,
         uint256 _tokenAmount,
         address _campaign
-    ) external payable nonReentrant returns (address pool, uint256 lpAmount) {
+    ) external payable nonReentrant onlyRouter returns (address pool, uint256 lpAmount) {
         if (_token == address(0)) revert ZeroAddress();
         if (_tokenAmount == 0) revert ZeroAmount();
         if (msg.value == 0) revert InsufficientETH();
@@ -160,6 +181,15 @@ contract VibesLPLocker is ReentrancyGuard {
         }
 
         emit LPCreatedAndLocked(_token, pool, _campaign, actualTokens, actualETH, lpAmount);
+    }
+
+    // ============ Admin Functions ============
+
+    /// @notice Update the authorized router address
+    /// @param _router New authorized router address
+    function setAuthorizedRouter(address _router) external onlyOwner {
+        if (_router == address(0)) revert ZeroAddress();
+        authorizedRouter = _router;
     }
 
     // ============ View Functions ============

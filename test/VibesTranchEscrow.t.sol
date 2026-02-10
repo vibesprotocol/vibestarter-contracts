@@ -802,17 +802,38 @@ contract VibesTranchEscrowTest is Test {
         assertEq(uint8(campaign.state), uint8(VibesTranchEscrow.CampaignState.Frozen));
     }
 
-    function test_TransferAdmin() public {
+    function test_TransferAdmin_TwoStep() public {
         VibesTranchEscrow escrow = _createFixedGoalEscrow();
 
         address newAdmin = makeAddr("newAdmin");
 
+        // Step 1: Current admin initiates transfer
         vm.prank(admin);
         escrow.transferAdmin(newAdmin);
 
-        assertEq(escrow.admin(), newAdmin);
+        // Admin is still the old admin until accepted
+        assertEq(escrow.admin(), admin);
+        assertEq(escrow.pendingAdmin(), newAdmin);
 
-        // Old admin can't act
+        // Old admin can still act
+        vm.prank(admin);
+        escrow.pauseCampaign();
+        vm.prank(admin);
+        escrow.resumeCampaign();
+
+        // Random address can't accept
+        vm.prank(backer1);
+        vm.expectRevert(VibesTranchEscrow.OnlyPendingAdmin.selector);
+        escrow.acceptAdmin();
+
+        // Step 2: New admin accepts
+        vm.prank(newAdmin);
+        escrow.acceptAdmin();
+
+        assertEq(escrow.admin(), newAdmin);
+        assertEq(escrow.pendingAdmin(), address(0));
+
+        // Old admin can't act anymore
         vm.prank(admin);
         vm.expectRevert(VibesTranchEscrow.OnlyAdmin.selector);
         escrow.pauseCampaign();

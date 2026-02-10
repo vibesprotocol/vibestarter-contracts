@@ -28,6 +28,9 @@ contract VibesLPLockerTest is Test {
         // Deploy locker
         locker = new VibesLPLocker(address(router), factory);
 
+        // Set this test contract as authorized router
+        locker.setAuthorizedRouter(address(this));
+
         // Deploy test token
         token = new VibesToken("Test Token", "TEST", 18, TOKEN_SUPPLY, founder);
 

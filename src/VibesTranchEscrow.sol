@@ -92,6 +92,7 @@ contract VibesTranchEscrow is ReentrancyGuard {
     bool private _initialized;
 
     address public admin;
+    address public pendingAdmin;
     address public platformWallet;
     address public timeOracle;    // 0x0 in production, mock for testnet
 
@@ -115,6 +116,9 @@ contract VibesTranchEscrow is ReentrancyGuard {
 
     // Effective raised amount (after pro-rata calculations for oversubscribed campaigns)
     uint256 public effectiveRaised;
+
+    // Track total excess refunds claimed (for accurate frozen balance calculation)
+    uint256 public totalExcessClaimed;
 
     // ============ Events ============
 
@@ -148,6 +152,7 @@ contract VibesTranchEscrow is ReentrancyGuard {
 
     event FounderUpdate(address indexed founder, string ipfsCid, uint256 timestamp);
     event AdminTransferred(address indexed oldAdmin, address indexed newAdmin);
+    event AdminTransferInitiated(address indexed currentAdmin, address indexed pendingAdmin);
     event LPWithdrawn(address indexed lpLocker, uint256 amount);
     event CampaignFinalized(uint256 effectiveRaised, uint256 excessForRefunds);
     event FrozenBalanceRecorded(uint256 ethBalance, uint256 tokenSupply);
@@ -155,6 +160,7 @@ contract VibesTranchEscrow is ReentrancyGuard {
     // ============ Errors ============
 
     error OnlyAdmin();
+    error OnlyPendingAdmin();
     error OnlyFounder();
     error InvalidState(CampaignState current, CampaignState required);
     error CampaignEnded();
@@ -296,6 +302,16 @@ contract VibesTranchEscrow is ReentrancyGuard {
         excludedBalance += token.balanceOf(address(0x000000000000000000000000000000000000dEaD));
 
         return totalSupply > excludedBalance ? totalSupply - excludedBalance : 0;
+    }
+
+    // ============ Pending Excess Helper ============
+
+    /// @dev Calculate pending (unclaimed) ProRata excess refunds
+    function _pendingExcessRefunds() internal view returns (uint256) {
+        if (campaign.raiseType != RaiseType.ProRata) return 0;
+        if (campaign.totalCommitted <= campaign.goal) return 0;
+        uint256 totalExcess = campaign.totalRaised - effectiveRaised;
+        return totalExcess > totalExcessClaimed ? totalExcess - totalExcessClaimed : 0;
     }
 
     // ============ Contribution Functions ============
@@ -594,7 +610,9 @@ contract VibesTranchEscrow is ReentrancyGuard {
 
         // Record frozen balances for holder refund calculations
         // Use redeemable supply (excludes LP at 0xdead, vesting, staker rewards, router)
-        frozenEthBalance = address(this).balance;
+        // Subtract pending excess refunds to avoid double-counting ProRata overpayments
+        uint256 pendingExcess = _pendingExcessRefunds();
+        frozenEthBalance = address(this).balance - pendingExcess;
         frozenTotalSupply = _calculateRedeemableSupply(_excludeAddresses);
 
         // Return stake to challenger
@@ -673,7 +691,9 @@ contract VibesTranchEscrow is ReentrancyGuard {
 
         // Record frozen balances for holder refund calculations
         // Use redeemable supply (excludes LP at 0xdead, vesting, staker rewards, router)
-        frozenEthBalance = address(this).balance;
+        // Subtract pending excess refunds to avoid double-counting ProRata overpayments
+        uint256 pendingExcess = _pendingExcessRefunds();
+        frozenEthBalance = address(this).balance - pendingExcess;
         frozenTotalSupply = _calculateRedeemableSupply(_excludeAddresses);
 
         emit FrozenBalanceRecorded(frozenEthBalance, frozenTotalSupply);
@@ -688,13 +708,20 @@ contract VibesTranchEscrow is ReentrancyGuard {
         emit RefundMerkleRootSet(_merkleRoot, campaign.snapshotBlock);
     }
 
-    /// @notice Transfer admin role
-    /// @param _newAdmin New admin address
+    /// @notice Initiate admin transfer (2-step process)
+    /// @param _newAdmin New admin address (must call acceptAdmin() to complete)
     function transferAdmin(address _newAdmin) external onlyAdmin {
         if (_newAdmin == address(0)) revert ZeroAddress();
-        address oldAdmin = admin;
-        admin = _newAdmin;
-        emit AdminTransferred(oldAdmin, _newAdmin);
+        pendingAdmin = _newAdmin;
+        emit AdminTransferInitiated(admin, _newAdmin);
+    }
+
+    /// @notice Accept admin transfer (must be called by pending admin)
+    function acceptAdmin() external {
+        if (msg.sender != pendingAdmin) revert OnlyPendingAdmin();
+        emit AdminTransferred(admin, pendingAdmin);
+        admin = pendingAdmin;
+        pendingAdmin = address(0);
     }
 
     // ============ Refund Functions ============
@@ -767,6 +794,7 @@ contract VibesTranchEscrow is ReentrancyGuard {
         if (excess == 0) revert NoExcessToRefund();
 
         contrib.excessClaimed = true;
+        totalExcessClaimed += excess;
 
         (bool success, ) = msg.sender.call{value: excess}("");
         require(success, "Excess refund failed");

@@ -1,225 +1,54 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import {VibesRouterStorage} from "./VibesRouterStorage.sol";
 import {VibesTokenFactory} from "./VibesTokenFactory.sol";
 import {VibesRegistry} from "./VibesRegistry.sol";
 import {VibesTranchEscrowFactory} from "./VibesTranchEscrowFactory.sol";
 import {VibesTranchEscrow} from "./VibesTranchEscrow.sol";
 import {VibesLPLocker} from "./VibesLPLocker.sol";
-import {VibesTokenDistributorV2} from "./VibesTokenDistributorV2.sol";
 import {VibesVesting} from "./VibesVesting.sol";
+import {VibesTreasuryEscrow} from "./VibesTreasuryEscrow.sol";
+import {VibesCommunityRewardsFactory} from "./VibesCommunityRewardsFactory.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
-import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 /**
  * @title VibesLaunchRouterV2
  * @notice Main entrypoint for launching VibesCertified tokens with tranche-based escrow and LP locking
  * @dev V2 Features:
- *      - Time-based tranche releases (10% kickstart + 15% × 6 months)
+ *      - Time-based tranche releases (10% kickstart + 15% x 6 months)
  *      - Three raise types: Fixed Goal, Open-Ended, Pro-Rata
  *      - Automatic LP creation and permanent locking via Aerodrome
- *      - Dynamic token allocation: Backers 80% * (1-founderAlloc), LP 20% * (1-founderAlloc), Founder 0-10%
+ *      - Fixed token allocation: LP 15%, Ecosystem 2.5%, Founder 0-7.5%, Treasury 0-17.5%, Backers remainder
  *      - LP price matches raise price
+ *
+ *      Admin functions, view helpers, and less-critical operations are in VibesRouterExtension,
+ *      accessed via delegatecall fallback to stay under the 24.576 KB contract size limit.
  */
-contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable, Ownable2Step {
+contract VibesLaunchRouterV2 is VibesRouterStorage {
     using SafeERC20 for IERC20;
 
-    // ============================================
-    // EVENTS
-    // ============================================
+    /// @notice Extension contract for delegatecall (immutable, does not use storage slot)
+    address public immutable extension;
 
-    event VibesCertified(
-        address indexed token,
-        address indexed founder,
-        bytes32 capsuleHash,
-        uint8 agentTool,
-        uint8 modelProvider,
-        uint8 proofType,
-        bytes32 artifactHash
-    );
-
-    event CampaignLaunched(
-        address indexed token,
-        address indexed escrow,
-        address indexed founder,
-        VibesTranchEscrow.RaiseType raiseType,
-        uint256 goal,
-        uint256 deadline
-    );
-
-    event LPCreated(
-        address indexed token,
-        address indexed pool,
-        uint256 tokenAmount,
-        uint256 ethAmount,
-        uint256 lpLocked
-    );
-
-    event DistributorCreated(
-        address indexed token,
-        address indexed distributor,
-        address indexed founder
-    );
-
-    event VestingCreated(
-        address indexed token,
-        address indexed vesting,
-        address indexed founder,
-        uint256 amount
-    );
-
-    event DepositCollected(
-        address indexed founder,
-        address indexed token,
-        uint256 amount
-    );
-
-    event DepositRefunded(
-        address indexed founder,
-        address indexed token,
-        uint256 amount
-    );
-
-    event DepositForfeited(
-        address indexed founder,
-        address indexed token,
-        uint256 amount
-    );
-
-    event TokensClaimed(
-        address indexed token,
-        address indexed backer,
-        uint256 amount
-    );
-
-    event StakerRewardsAllocated(
-        address indexed token,
-        address indexed rewardsContract,
-        uint256 amount
-    );
-
-    event StakerTokensRedirectedToBackers(
-        address indexed token,
-        uint256 amount
-    );
-
-    // ============================================
-    // CONSTANTS
-    // ============================================
-
-    /// @notice Maximum founder allocation (10%)
-    uint256 public constant MAX_FOUNDER_ALLOCATION_BPS = 1000;
-
-    /// @notice LP allocation ratio (20% of remaining after founder)
-    uint256 public constant LP_ALLOCATION_RATIO = 2000; // 20% in BPS
-
-    /// @notice ETH to LP ratio (20% of raised ETH)
-    uint256 public constant ETH_TO_LP_BPS = 2000; // 20%
-
-    /// @notice Default vesting duration (12 months)
-    uint256 public constant DEFAULT_VESTING_DURATION = 365 days;
-
-    /// @notice BPS denominator
-    uint256 public constant BPS_DENOMINATOR = 10000;
-
-    // ============================================
-    // STATE
-    // ============================================
-
-    /// @notice Token factory contract
-    VibesTokenFactory public immutable tokenFactory;
-
-    /// @notice Provenance registry contract
-    VibesRegistry public immutable registry;
-
-    /// @notice Tranche escrow factory contract
-    VibesTranchEscrowFactory public escrowFactory;
-
-    /// @notice LP locker contract
-    VibesLPLocker public lpLocker;
-
-    /// @notice Fee settings
-    bool public feesEnabled;
-    uint256 public flatFeeWei;
-    address public feeRecipient;
-
-    /// @notice Ops wallet for unclaimed fund sweeps
-    address public opsWallet;
-
-    /// @notice Staker rewards contract for $VIBES staker distributions
-    address public stakerRewardsContract;
-
-    /// @notice Token to escrow mapping
-    mapping(address => address) public tokenToEscrow;
-
-    /// @notice Token to vesting mapping
-    mapping(address => address) public tokenToVesting;
-
-    /// @notice Token to distributor mapping
-    mapping(address => address) public tokenToDistributor;
-
-    /// @notice Founder deposit amount (anti-spam)
-    uint256 public founderDepositWei = 0.05 ether;
-
-    /// @notice Token to deposit mapping (tracks deposit amounts per token)
-    mapping(address => uint256) public tokenDeposits;
-
-    /// @notice Pending LP data (tokens held until campaign succeeds)
-    struct PendingLP {
-        uint256 tokenAmount;
-        uint256 backerAllocation; // To calculate ETH for LP
-        uint256 stakerAllocation; // 2% for $VIBES stakers
-    }
-    mapping(address => PendingLP) public pendingLP;
-
-    /// @notice Backer tokens available for claims per token
-    mapping(address => uint256) public backerTokensForClaims;
-
-    /// @notice Track whether a backer has claimed tokens for a specific campaign
-    mapping(address => mapping(address => bool)) public hasClaimedTokens; // token => backer => claimed
-
-    // ============================================
-    // ERRORS
-    // ============================================
-
-    error ZeroAddress();
-    error InvalidAllocation();
-    error CampaignNotFunded();
-    error LPAlreadyCreated();
-    error NoPendingLP();
-    error EscrowFactoryNotSet();
-    error LPLockerNotSet();
-    error OpsWalletNotSet();
-    error LPNotCreated();
-    error InsufficientDeposit();
-    error NoDepositToRefund();
-    error DepositAlreadyProcessed();
-    error RefundFailed();
-    error OnlyEscrow();
-    error AlreadyClaimed();
-    error NotABacker();
-    error NothingToClaim();
-    error CampaignNotReady();
-    error TooManyTokens();
+    /// @notice EIP-712 typehash for launch authorization
+    bytes32 public constant LAUNCH_TYPEHASH = keccak256("LaunchAuthorization(address founder,uint256 nonce,uint256 deadline)");
 
     // ============================================
     // CONSTRUCTOR
     // ============================================
 
     constructor(
+        address _extension,
         address _tokenFactory,
         address _registry,
         address _escrowFactory,
         address payable _lpLocker
-    ) Ownable(msg.sender) {
-        if (_tokenFactory == address(0)) revert ZeroAddress();
-        if (_registry == address(0)) revert ZeroAddress();
-
-        tokenFactory = VibesTokenFactory(_tokenFactory);
-        registry = VibesRegistry(_registry);
+    ) VibesRouterStorage(_tokenFactory, _registry) {
+        if (_extension == address(0)) revert ZeroAddress();
+        extension = _extension;
 
         if (_escrowFactory != address(0)) {
             escrowFactory = VibesTranchEscrowFactory(_escrowFactory);
@@ -228,7 +57,19 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable, Ownable2Step {
             lpLocker = VibesLPLocker(_lpLocker);
         }
 
+        owner = msg.sender;
         feeRecipient = msg.sender;
+
+        // Compute EIP-712 domain separator for launch signature verification
+        _launchDomainSeparator = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("VibesLaunchRouter"),
+                keccak256("1"),
+                block.chainid,
+                address(this)
+            )
+        );
     }
 
     // ============================================
@@ -249,7 +90,7 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable, Ownable2Step {
         uint8 modelProvider,
         uint8 proofType,
         bytes32 proofArtifactHash
-    ) external payable returns (address token) {
+    ) external payable whenNotPaused returns (address token) {
         _handleFees();
 
         if (capsuleHash == bytes32(0)) revert ZeroAddress();
@@ -277,9 +118,9 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable, Ownable2Step {
      * @param goal Goal amount (required for FixedGoal, hard cap for ProRata)
      * @param softCap Soft cap (optional, only for OpenEnded)
      * @param deadline Campaign deadline timestamp
-     * @param founderAllocationBps Founder allocation 0-1000 (0-10%)
+     * @param founderAllocationBps Founder allocation 0-750 (0-7.5%)
+     * @param treasuryAllocationBps Treasury allocation: 0 (disabled) or 1000-1750 (10-17.5%). founder+treasury <= 1750
      * @param raiseStart When contributions begin (0 = immediate)
-     * @param founderVestingCliff Cliff period for founder vesting in seconds (0 = no cliff)
      * @return token Address of the deployed token
      * @return escrow Address of the campaign escrow
      * @return vesting Address of the founder vesting contract
@@ -299,11 +140,34 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable, Ownable2Step {
         uint256 softCap,
         uint256 deadline,
         uint256 founderAllocationBps,
+        uint256 treasuryAllocationBps,
         uint256 raiseStart,
-        uint256 founderVestingCliff
+        uint256 launchNonce,
+        uint256 sigDeadline,
+        bytes calldata launchSignature
     ) external payable nonReentrant whenNotPaused returns (address token, address escrow, address vesting) {
+        // Verify launch authorization signature (if trustedLaunchSigner is set)
+        _verifyLaunchSignature(msg.sender, launchNonce, sigDeadline, launchSignature);
+
         if (address(escrowFactory) == address(0)) revert EscrowFactoryNotSet();
         if (founderAllocationBps > MAX_FOUNDER_ALLOCATION_BPS) revert InvalidAllocation();
+        // Treasury: must be 0 (disabled) or between MIN (10%) and MAX (17.5%)
+        if (treasuryAllocationBps > 0) {
+            if (treasuryAllocationBps < MIN_TREASURY_ALLOCATION_BPS) revert InvalidTreasuryAllocation();
+            if (treasuryAllocationBps > MAX_TREASURY_ALLOCATION_BPS) revert InvalidTreasuryAllocation();
+        }
+        // Combined founder + treasury capped independently of each individual max
+        // (see MAX_FOUNDER_PLUS_TREASURY_BPS). Backer protection is enforced below
+        // by the 50% backer floor, not by squeezing this cap.
+        if (founderAllocationBps + treasuryAllocationBps > MAX_FOUNDER_PLUS_TREASURY_BPS) revert InvalidTreasuryAllocation();
+
+        // Audit fix: validate goal for raise types that require it
+        if (raiseType == VibesTranchEscrow.RaiseType.FixedGoal) {
+            require(goal > 0, "FixedGoal requires goal > 0");
+        }
+        if (raiseType == VibesTranchEscrow.RaiseType.ProRata) {
+            require(goal > 0, "ProRata requires goal > 0");
+        }
 
         // Collect deposit + fees
         _handleFeesAndDeposit();
@@ -311,19 +175,41 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable, Ownable2Step {
         if (capsuleHash == bytes32(0)) revert ZeroAddress();
         if (proofArtifactHash == bytes32(0)) revert ZeroAddress();
 
-        // Calculate token allocations
-        // Remaining after founder = 100% - founderAlloc
-        // Of remaining: ~77.78% to backers, ~20% to LP, ~2.22% to stakers
-        // This achieves 70/18/2 split at 10% founder allocation
-        uint256 remainingBps = BPS_DENOMINATOR - founderAllocationBps;
-        uint256 backerAllocationBps = (remainingBps * 7778) / BPS_DENOMINATOR;
-        uint256 stakerAllocationBps = (remainingBps * 222) / BPS_DENOMINATOR;
-        uint256 lpAllocationBps = remainingBps - backerAllocationBps - stakerAllocationBps;
+        // PC-01: admin-toggleable staker-allocation disable. When `stakerAllocationDisabled`
+        // is set (admin-only via setStakerAllocationDisabled in the extension), the 2.5%
+        // ecosystem slice is skipped entirely and absorbed into the backer slice. Used for the
+        // $VIBES TGE (no stakers at TGE finalisation) and all pre-Luxembourg-entity raises.
+        // Admin flips the flag off once the operating entity is formed.
+        bool stakerDisabled = stakerAllocationDisabled;
+
+        // PC-02: admin-pre-authorized per-launcher Community Rewards slice. When the caller
+        // has a non-zero `communityConfigForLaunch`, the router transfers `(totalSupply *
+        // bps / 10000)` to the configured recipient at launch time. The config is deleted
+        // immediately after consumption (one-shot). Default (no entry): no community slice —
+        // same as any unauthorized founder.
+        LaunchCommunityConfig memory communityConfig = communityConfigForLaunch[msg.sender];
+        uint256 communityBps = communityConfig.bps;
+
+        // Calculate token allocations (fixed model)
+        // LP: 15% fixed, Ecosystem: 2.5% fixed (unless stakerAllocationDisabled absorbs it)
+        // Treasury: 0% or 10-17.5% (at 17.5%, founder must be 0%)
+        // Community: 0 by default; 0-20% when admin pre-authorized this launcher (PC-02)
+        // Backers: everything else; must be >= MIN_BACKER_ALLOCATION_BPS (50%) or revert
+        uint256 ecosystemBps = stakerDisabled ? 0 : ECOSYSTEM_ALLOCATION_BPS;
+        uint256 backerAllocationBps = BPS_DENOMINATOR - founderAllocationBps - treasuryAllocationBps - LP_ALLOCATION_BPS - ecosystemBps - communityBps;
+
+        // PC-02: enforce the 50% backer floor. Protects backers from any combination of
+        // slices that would leave them below the minimum. In practice this only matters when
+        // a community slice is authorized — founder/treasury/LP/ecosystem alone cannot push
+        // backers below ~57.5% given their current caps.
+        if (backerAllocationBps < MIN_BACKER_ALLOCATION_BPS) revert BackerAllocationTooLow();
 
         uint256 founderTokens = (totalSupply * founderAllocationBps) / BPS_DENOMINATOR;
-        uint256 backerTokens = (totalSupply * backerAllocationBps) / BPS_DENOMINATOR;
-        uint256 stakerTokens = (totalSupply * stakerAllocationBps) / BPS_DENOMINATOR;
-        uint256 lpTokens = totalSupply - founderTokens - backerTokens - stakerTokens;
+        uint256 treasuryTokens = (totalSupply * treasuryAllocationBps) / BPS_DENOMINATOR;
+        uint256 stakerTokens = (totalSupply * ecosystemBps) / BPS_DENOMINATOR;
+        uint256 lpTokens = (totalSupply * LP_ALLOCATION_BPS) / BPS_DENOMINATOR;
+        uint256 communityTokens = (totalSupply * communityBps) / BPS_DENOMINATOR;
+        uint256 backerTokens = totalSupply - founderTokens - treasuryTokens - stakerTokens - lpTokens - communityTokens;
 
         // Deploy token - all tokens go to this router initially
         token = tokenFactory.deployToken(name, symbol, decimals, totalSupply, address(this));
@@ -331,6 +217,7 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable, Ownable2Step {
         // Track deposit for this token
         if (founderDepositWei > 0) {
             tokenDeposits[token] = founderDepositWei;
+            totalReservedDeposits += founderDepositWei;
             emit DepositCollected(msg.sender, token, founderDepositWei);
         }
 
@@ -350,20 +237,46 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable, Ownable2Step {
 
         tokenToEscrow[token] = escrow;
 
-        // Store pending LP info (LP created after campaign succeeds)
+        // Store pending LP info (LP created after campaign succeeds).
+        // When stakerAllocationDisabled is true, stakerTokens is 0 — the Phase 2 staker
+        // branch in VibesRouterExtension._executePhase2 short-circuits when stakerTokens == 0,
+        // so no transfer or notifyReward is attempted against VibesStakerRewards.
         pendingLP[token] = PendingLP({
             tokenAmount: lpTokens,
             backerAllocation: backerTokens,
             stakerAllocation: stakerTokens
         });
 
+        if (stakerDisabled) {
+            emit StakerAllocationDisabledForLaunch(token, escrow);
+        }
+
+        // PC-03: atomically deploy a fresh VibesCommunityRewards bound to the new token,
+        // transfer the slice to it, and consume the authorization. Mirrors the pattern used
+        // for VibesVesting and VibesTreasuryEscrow above — except the actual `new` is
+        // delegated to VibesCommunityRewardsFactory so the router's own bytecode stays
+        // under the EIP-170 24,576-byte runtime limit. The factory call still happens in
+        // the same transaction, preserving atomicity.
+        if (communityBps > 0) {
+            if (communityRewardsFactory == address(0)) revert CommunityRewardsFactoryNotSet();
+            delete communityConfigForLaunch[msg.sender];
+            address crAddr = VibesCommunityRewardsFactory(communityRewardsFactory).create(
+                IERC20(token),
+                block.timestamp + communityConfig.cliffDuration,
+                communityConfig.communityAdmin
+            );
+            tokenToCommunityRewards[token] = crAddr;
+            IERC20(token).safeTransfer(crAddr, communityTokens);
+            emit CommunityAllocationConsumed(token, msg.sender, crAddr, communityTokens);
+        }
+
         // Create vesting for founder if allocation > 0
         if (founderTokens > 0) {
             VibesVesting newVesting = new VibesVesting(
                 token,
                 msg.sender,
-                DEFAULT_VESTING_DURATION,
-                founderVestingCliff
+                useTestnetContracts ? 6 days : 180 days,
+                useTestnetContracts ? 12 days : 365 days
             );
             vesting = address(newVesting);
             tokenToVesting[token] = vesting;
@@ -374,6 +287,33 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable, Ownable2Step {
             emit VestingCreated(token, vesting, msg.sender, founderTokens);
         }
 
+        // Create treasury escrow if allocation > 0
+        if (treasuryTokens > 0) {
+            // Use operations admin for day-to-day challenge resolution.
+            // Falls back to owner if operationsAdmin not yet set.
+            address treasuryAdmin = operationsAdmin != address(0) ? operationsAdmin : owner;
+            VibesTreasuryEscrow newTreasury = new VibesTreasuryEscrow(
+                token,
+                msg.sender,
+                treasuryAdmin,  // Operations admin resolves treasury challenges
+                useTestnetContracts ? 6 days : 180 days,
+                useTestnetContracts ? 2 hours : 14 days,
+                useTestnetContracts ? 2 hours : 72 hours
+            );
+            address treasuryAddr = address(newTreasury);
+            tokenToTreasury[token] = treasuryAddr;
+
+            IERC20(token).safeTransfer(treasuryAddr, treasuryTokens);
+
+            // Link vesting to treasury so malicious upheld can freeze vesting
+            if (vesting != address(0)) {
+                newTreasury.setVestingContract(vesting);
+                VibesVesting(vesting).setAuthorizedFreezer(treasuryAddr);
+            }
+
+            emit TreasuryCreated(token, treasuryAddr, msg.sender, treasuryTokens);
+        }
+
         // Note: Backer tokens and LP tokens stay in router until campaign succeeds
         // They are distributed/locked via finalizeSuccessfulCampaign()
 
@@ -381,358 +321,39 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable, Ownable2Step {
     }
 
     /**
-     * @notice Finalize a successful campaign - creates LP and enables token distribution
-     * @dev Called after campaign is finalized as Funded. Withdraws ETH from escrow, creates LP, locks it.
-     * @param token Token address
-     */
-    function finalizeSuccessfulCampaign(address token) external nonReentrant {
-        if (address(lpLocker) == address(0)) revert LPLockerNotSet();
-
-        address escrowAddr = tokenToEscrow[token];
-        if (escrowAddr == address(0)) revert ZeroAddress();
-
-        VibesTranchEscrow escrow = VibesTranchEscrow(payable(escrowAddr));
-        VibesTranchEscrow.Campaign memory campaign = escrow.getCampaign();
-
-        // Verify campaign is funded
-        if (campaign.state != VibesTranchEscrow.CampaignState.Funded) {
-            revert CampaignNotFunded();
-        }
-
-        PendingLP memory lpData = pendingLP[token];
-        if (lpData.tokenAmount == 0) revert NoPendingLP();
-
-        // LP ETH was already sent to this router by escrow during finalize()
-        uint256 ethForLP = escrow.getLPEthSent();
-
-        // Approve LP locker to take tokens
-        IERC20(token).approve(address(lpLocker), lpData.tokenAmount);
-
-        // Create and lock LP
-        (address pool, uint256 lpAmount) = lpLocker.createAndLockLP{value: ethForLP}(
-            token,
-            lpData.tokenAmount,
-            escrowAddr
-        );
-
-        // Clear pending LP
-        delete pendingLP[token];
-
-        // Start founder vesting now that campaign is funded
-        address vestingAddr = tokenToVesting[token];
-        if (vestingAddr != address(0)) {
-            VibesVesting(vestingAddr).startVesting();
-        }
-
-        // Auto-refund founder deposit on successful raise
-        uint256 depositAmount = tokenDeposits[token];
-        if (depositAmount > 0) {
-            delete tokenDeposits[token];
-            (bool sent, ) = campaign.founder.call{value: depositAmount}("");
-            if (sent) {
-                emit DepositRefunded(campaign.founder, token, depositAmount);
-            }
-            // Note: If refund fails, deposit stays in contract for manual recovery
-            // This prevents blocking finalization due to founder wallet issues
-        }
-
-        emit LPCreated(token, pool, lpData.tokenAmount, ethForLP, lpAmount);
-    }
-
-    /**
-     * @notice Create a token distributor for a successful campaign (permissionless)
-     * @dev Anyone can call this after LP has been created. Enables backers to claim tokens
-     *      even if founder is unresponsive.
-     * @param token Token address
-     * @return distributor Address of the deployed distributor
-     */
-    function createDistributor(address token) external nonReentrant returns (address distributor) {
-        address escrowAddr = tokenToEscrow[token];
-        if (escrowAddr == address(0)) revert ZeroAddress();
-
-        VibesTranchEscrow escrow = VibesTranchEscrow(payable(escrowAddr));
-        VibesTranchEscrow.Campaign memory campaign = escrow.getCampaign();
-
-        // Verify campaign is funded
-        if (campaign.state != VibesTranchEscrow.CampaignState.Funded) {
-            revert CampaignNotFunded();
-        }
-
-        // Calculate backer tokens (total supply - founder - LP)
-        uint256 totalSupply = IERC20(token).totalSupply();
-        PendingLP memory lpData = pendingLP[token];
-
-        // If LP already created, lpData.tokenAmount will be 0
-        // We need to track backer allocation differently
-        // For now, get balance held by router
-        uint256 routerBalance = IERC20(token).balanceOf(address(this));
-
-        // Ensure LP has been created first (enforces proper ordering)
-        if (lpData.tokenAmount > 0) revert LPNotCreated();
-        if (opsWallet == address(0)) revert OpsWalletNotSet();
-
-        // Deploy distributor with ops wallet for sweep functionality
-        VibesTokenDistributorV2 newDistributor = new VibesTokenDistributorV2(
-            token,
-            campaign.founder,
-            escrowAddr,
-            opsWallet,
-            owner()
-        );
-        distributor = address(newDistributor);
-        tokenToDistributor[token] = distributor;
-
-        // Transfer backer tokens to distributor
-        uint256 backerTokens = routerBalance;
-        if (backerTokens > 0) {
-            IERC20(token).safeTransfer(distributor, backerTokens);
-        }
-
-        emit DistributorCreated(token, distributor, campaign.founder);
-    }
-
-    /**
      * @notice Complete finalization of a successful campaign - creates LP and distributor atomically
      * @dev Called by escrow during finalize(). Creates LP, locks it, and sets up token distribution.
      *      This allows the entire finalization to happen in one transaction when the raise ends.
      * @param token Token address
+     *
+     *      NOTE: Intentionally omits nonReentrant - called by trusted escrow during
+     *      finalize(). Adding nonReentrant causes revert when triggered via claimTokens().
      */
-    function completeFinalization(address token) external nonReentrant whenNotPaused {
-        address escrowAddr = tokenToEscrow[token];
-        if (escrowAddr == address(0)) revert ZeroAddress();
-
-        // Only the escrow can call this
-        if (msg.sender != escrowAddr) revert OnlyEscrow();
-
-        if (address(lpLocker) == address(0)) revert LPLockerNotSet();
-
-        VibesTranchEscrow escrow = VibesTranchEscrow(payable(escrowAddr));
-        VibesTranchEscrow.Campaign memory campaign = escrow.getCampaign();
-
-        // Campaign should be in Funded state (set by escrow before calling this)
-        if (campaign.state != VibesTranchEscrow.CampaignState.Funded) {
-            revert CampaignNotFunded();
-        }
-
-        PendingLP memory lpData = pendingLP[token];
-        if (lpData.tokenAmount == 0) revert NoPendingLP();
-        if (opsWallet == address(0)) revert OpsWalletNotSet();
-
-        // === Step 1: Create and lock LP ===
-        // LP ETH was already sent to this router by escrow during finalize()
-        // No callback into escrow needed - eliminating cross-contract re-entry
-
-        uint256 ethForLP = escrow.getLPEthSent();
-
-        // Approve LP locker to take tokens
-        IERC20(token).approve(address(lpLocker), lpData.tokenAmount);
-
-        // Create and lock LP (forward ETH from escrow to lpLocker)
-        (address pool, uint256 lpAmount) = lpLocker.createAndLockLP{value: ethForLP}(
-            token,
-            lpData.tokenAmount,
-            escrowAddr
-        );
-
-        // Clear pending LP
-        delete pendingLP[token];
-
-        // Start founder vesting now that campaign is funded
-        address vestingAddr = tokenToVesting[token];
-        if (vestingAddr != address(0)) {
-            VibesVesting(vestingAddr).startVesting();
-        }
-
-        emit LPCreated(token, pool, lpData.tokenAmount, ethForLP, lpAmount);
-
-        // === Step 2: Transfer staker rewards if contract is set ===
-        uint256 stakerTokens = lpData.stakerAllocation;
-        if (stakerRewardsContract != address(0) && stakerTokens > 0) {
-            IERC20(token).safeTransfer(stakerRewardsContract, stakerTokens);
-            emit StakerRewardsAllocated(token, stakerRewardsContract, stakerTokens);
-        } else if (stakerTokens > 0) {
-            // Staker rewards contract not set - tokens remain for backers
-            emit StakerTokensRedirectedToBackers(token, stakerTokens);
-        }
-
-        // === Step 3: Record backer tokens available for claims ===
-        // Tokens stay in the router - backers claim directly via claimTokens()
-        uint256 routerBalance = IERC20(token).balanceOf(address(this));
-        backerTokensForClaims[token] = routerBalance;
-
-        // === Step 4: Auto-refund founder deposit on successful raise ===
-        uint256 depositAmount = tokenDeposits[token];
-        if (depositAmount > 0) {
-            delete tokenDeposits[token];
-            (bool sent, ) = campaign.founder.call{value: depositAmount}("");
-            if (sent) {
-                emit DepositRefunded(campaign.founder, token, depositAmount);
-            }
-            // Note: If refund fails, deposit stays in contract for manual recovery
-            // This prevents blocking finalization due to founder wallet issues
-        }
-    }
-
-    /**
-     * @notice Claim tokens for a funded campaign (auto-finalizes if needed)
-     * @dev Backer calls this to claim their token allocation. If the raise has ended
-     *      but hasn't been finalized yet, this will finalize it first.
-     * @param token Token address of the campaign
-     */
-    function claimTokens(address token) external nonReentrant whenNotPaused {
-        _claimTokensInternal(token);
-    }
-
-    /**
-     * @notice Batch claim tokens from multiple funded campaigns
-     * @dev Reverts if any individual claim fails. Frontend should pre-filter to claimable tokens.
-     * @param tokens Array of token addresses to claim from
-     */
-    function batchClaimTokens(address[] calldata tokens) external nonReentrant whenNotPaused {
-        if (tokens.length == 0) revert NothingToClaim();
-        if (tokens.length > 20) revert TooManyTokens();
-        for (uint256 i = 0; i < tokens.length; i++) {
-            _claimTokensInternal(tokens[i]);
-        }
-    }
-
-    /**
-     * @dev Internal claim logic shared by claimTokens and batchClaimTokens
-     */
-    function _claimTokensInternal(address token) internal {
-        address escrowAddr = tokenToEscrow[token];
-        if (escrowAddr == address(0)) revert ZeroAddress();
-
-        VibesTranchEscrow escrow = VibesTranchEscrow(payable(escrowAddr));
-        VibesTranchEscrow.Campaign memory campaign = escrow.getCampaign();
-
-        // Auto-finalize if campaign has ended but hasn't been finalized yet
-        if (campaign.state == VibesTranchEscrow.CampaignState.Active ||
-            campaign.state == VibesTranchEscrow.CampaignState.Paused) {
-            // Check if deadline has passed
-            if (block.timestamp < campaign.deadline) revert CampaignNotReady();
-            // Finalize the campaign (this will call completeFinalization via callback)
-            escrow.finalize();
-            // Re-fetch campaign state after finalization
-            campaign = escrow.getCampaign();
-        }
-
-        // Must be in Funded state to claim
-        if (campaign.state != VibesTranchEscrow.CampaignState.Funded) {
-            revert CampaignNotFunded();
-        }
-
-        // Check if already claimed
-        if (hasClaimedTokens[token][msg.sender]) revert AlreadyClaimed();
-
-        // Get backer's contribution from escrow
-        VibesTranchEscrow.Contribution memory contrib = escrow.getContribution(msg.sender);
-        if (contrib.amount == 0) revert NotABacker();
-
-        // Calculate effective contribution (handles pro-rata)
-        uint256 effectiveContribution = contrib.amount;
-        if (campaign.raiseType == VibesTranchEscrow.RaiseType.ProRata) {
-            uint256 totalCommitted = campaign.totalCommitted;
-            if (totalCommitted > campaign.goal) {
-                effectiveContribution = (contrib.amount * campaign.goal) / totalCommitted;
-            }
-        }
-
-        // Calculate token allocation
-        // tokenAmount = (effectiveContribution / effectiveRaised) * totalBackerTokens
-        uint256 effectiveRaised = escrow.effectiveRaised();
-        uint256 totalBackerTokens = backerTokensForClaims[token];
-
-        if (effectiveRaised == 0 || totalBackerTokens == 0) revert NothingToClaim();
-
-        uint256 tokenAmount = (effectiveContribution * totalBackerTokens) / effectiveRaised;
-
-        // Cap to remaining balance to handle rounding (prevents last-claimant revert)
-        uint256 remaining = IERC20(token).balanceOf(address(this));
-        if (tokenAmount > remaining) {
-            tokenAmount = remaining;
-        }
-        if (tokenAmount == 0) revert NothingToClaim();
-
-        // Mark as claimed, decrement pool, and transfer
-        hasClaimedTokens[token][msg.sender] = true;
-        backerTokensForClaims[token] -= tokenAmount;
-        IERC20(token).safeTransfer(msg.sender, tokenAmount);
-
-        emit TokensClaimed(token, msg.sender, tokenAmount);
-    }
-
-    /**
-     * @notice Get claimable amounts for multiple tokens at once
-     * @param tokens Array of token addresses
-     * @param backer Backer address
-     * @return amounts Array of claimable token amounts (0 for non-claimable)
-     */
-    function getBatchClaimableTokens(address[] calldata tokens, address backer) external view returns (uint256[] memory amounts) {
-        amounts = new uint256[](tokens.length);
-        for (uint256 i = 0; i < tokens.length; i++) {
-            amounts[i] = this.getClaimableTokens(tokens[i], backer);
-        }
-    }
-
-    /**
-     * @notice Get the token amount a backer can claim
-     * @param token Token address
-     * @param backer Backer address
-     * @return tokenAmount Amount of tokens claimable (0 if already claimed or not eligible)
-     */
-    function getClaimableTokens(address token, address backer) external view returns (uint256 tokenAmount) {
-        address escrowAddr = tokenToEscrow[token];
-        if (escrowAddr == address(0)) return 0;
-
-        if (hasClaimedTokens[token][backer]) return 0;
-
-        VibesTranchEscrow escrow = VibesTranchEscrow(payable(escrowAddr));
-        VibesTranchEscrow.Campaign memory campaign = escrow.getCampaign();
-
-        // Only calculate if funded (or will be funded when finalized)
-        if (campaign.state != VibesTranchEscrow.CampaignState.Funded &&
-            campaign.state != VibesTranchEscrow.CampaignState.Active &&
-            campaign.state != VibesTranchEscrow.CampaignState.Paused) {
-            return 0;
-        }
-
-        VibesTranchEscrow.Contribution memory contrib = escrow.getContribution(backer);
-        if (contrib.amount == 0) return 0;
-
-        uint256 effectiveContribution = contrib.amount;
-        if (campaign.raiseType == VibesTranchEscrow.RaiseType.ProRata) {
-            uint256 totalCommitted = campaign.totalCommitted;
-            if (totalCommitted > campaign.goal) {
-                effectiveContribution = (contrib.amount * campaign.goal) / totalCommitted;
-            }
-        }
-
-        uint256 effectiveRaised = escrow.effectiveRaised();
-        uint256 totalBackerTokens = backerTokensForClaims[token];
-
-        // If not finalized yet, estimate based on pending LP data
-        if (totalBackerTokens == 0) {
-            PendingLP memory lpData = pendingLP[token];
-            uint256 routerBalance = IERC20(token).balanceOf(address(this));
-            uint256 reserved = lpData.tokenAmount + lpData.stakerAllocation;
-            if (routerBalance < reserved) return 0;
-            totalBackerTokens = routerBalance - reserved;
-        }
-
-        if (effectiveRaised == 0) {
-            // Use totalRaised as estimate for effectiveRaised if not set yet
-            effectiveRaised = campaign.totalRaised;
-        }
-
-        if (effectiveRaised == 0 || totalBackerTokens == 0) return 0;
-
-        tokenAmount = (effectiveContribution * totalBackerTokens) / effectiveRaised;
-    }
+    // NOTE: completeFinalization, claimTokens, batchClaimTokens, and _claimTokensInternal
+    // have been moved to VibesRouterExtension.sol to reduce bytecode size.
+    // They are accessed transparently via the router's fallback -> delegatecall pattern.
 
     // ============================================
     // INTERNAL FUNCTIONS
     // ============================================
+
+    /// @notice Verify that the backend trusted signer authorized this launch
+    /// @dev If trustedLaunchSigner is address(0), gating is disabled (backwards compatible)
+    /// @dev Nonce must match current value for founder; incremented after successful verification
+    function _verifyLaunchSignature(address founder, uint256 nonce, uint256 sigDeadline, bytes calldata signature) internal {
+        if (trustedLaunchSigner == address(0)) return; // Gating disabled
+
+        if (nonce != launchNonces[founder]) revert InvalidNonce();
+        if (block.timestamp > sigDeadline) revert SignatureExpired();
+
+        bytes32 structHash = keccak256(abi.encode(LAUNCH_TYPEHASH, founder, nonce, sigDeadline));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _launchDomainSeparator, structHash));
+
+        address recovered = ECDSA.recover(digest, signature);
+        if (recovered != trustedLaunchSigner) revert InvalidSignature();
+
+        launchNonces[founder]++;
+    }
 
     function _handleFees() internal {
         if (feesEnabled) {
@@ -778,6 +399,14 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable, Ownable2Step {
                 require(refunded, "Refund failed");
             }
         }
+
+        // Burn $VIBES if configured (feature-flagged: both vibesToken and launchBurnAmount must be set)
+        if (address(vibesToken) != address(0) && launchBurnAmount > 0) {
+            // Transfer $VIBES from founder to dead address (permanent burn)
+            // Founder must have called vibesToken.approve(router, amount) beforehand
+            IERC20(address(vibesToken)).safeTransferFrom(msg.sender, address(0xdead), launchBurnAmount);
+            emit VibesBurned(msg.sender, launchBurnAmount);
+        }
     }
 
     function _registerProvenance(
@@ -810,152 +439,43 @@ contract VibesLaunchRouterV2 is ReentrancyGuard, Pausable, Ownable2Step {
     }
 
     // ============================================
-    // ADMIN FUNCTIONS
+    // EMERGENCY UNPAUSE (audit fix: accessible while paused)
     // ============================================
 
-    /// @notice Emergency pause - stops launches, claims, and finalization
-    function pause() external onlyOwner {
-        _pause();
-    }
-
-    /// @notice Unpause after emergency is resolved
-    function unpause() external onlyOwner {
+    /// @notice Emergency unpause — callable even when contract is paused
+    /// @dev Lives directly on the router (not behind fallback) so it remains
+    ///      reachable when the pause-guarded fallback blocks extension calls.
+    function emergencyUnpause() external {
+        if (msg.sender != owner) revert OnlyOwner();
         _unpause();
     }
 
-    function setFeeConfig(
-        bool _enabled,
-        uint256 _flatFeeWei,
-        address _recipient
-    ) external onlyOwner {
-        if (_recipient == address(0)) revert ZeroAddress();
-        feesEnabled = _enabled;
-        flatFeeWei = _flatFeeWei;
-        feeRecipient = _recipient;
-    }
-
-    function setEscrowFactory(address _escrowFactory) external onlyOwner {
-        if (_escrowFactory == address(0)) revert ZeroAddress();
-        escrowFactory = VibesTranchEscrowFactory(_escrowFactory);
-    }
-
-    function setLPLocker(address payable _lpLocker) external onlyOwner {
-        if (_lpLocker == address(0)) revert ZeroAddress();
-        lpLocker = VibesLPLocker(_lpLocker);
-    }
-
-    function setOpsWallet(address _opsWallet) external onlyOwner {
-        if (_opsWallet == address(0)) revert ZeroAddress();
-        opsWallet = _opsWallet;
-    }
-
-    /**
-     * @notice Set the staker rewards contract for $VIBES staker distributions
-     * @param _stakerRewardsContract Address of VibesStakerRewards contract
-     */
-    function setStakerRewardsContract(address _stakerRewardsContract) external onlyOwner {
-        if (_stakerRewardsContract == address(0)) revert ZeroAddress();
-        stakerRewardsContract = _stakerRewardsContract;
-    }
-
-    /**
-     * @notice Set the founder deposit amount
-     * @param _amount New deposit amount in wei
-     */
-    function setFounderDepositWei(uint256 _amount) external onlyOwner {
-        founderDepositWei = _amount;
-    }
-
-    /**
-     * @notice Refund deposit to founder (success or cancelled raise)
-     * @param token Token address to identify the deposit
-     * @param founder Address to receive the refund
-     */
-    function refundDeposit(address token, address founder) external onlyOwner {
-        uint256 depositAmount = tokenDeposits[token];
-        if (depositAmount == 0) revert NoDepositToRefund();
-
-        // Clear the deposit record
-        delete tokenDeposits[token];
-
-        // Transfer deposit back to founder
-        (bool sent, ) = founder.call{value: depositAmount}("");
-        if (!sent) revert RefundFailed();
-
-        emit DepositRefunded(founder, token, depositAmount);
-    }
-
-    /**
-     * @notice Forfeit deposit (spam/fraud removal)
-     * @param token Token address to identify the deposit
-     * @param founder Original founder address (for event)
-     */
-    function forfeitDeposit(address token, address founder) external onlyOwner {
-        uint256 depositAmount = tokenDeposits[token];
-        if (depositAmount == 0) revert NoDepositToRefund();
-
-        // Clear the deposit record
-        delete tokenDeposits[token];
-
-        // Transfer forfeited deposit to fee recipient (platform)
-        (bool sent, ) = feeRecipient.call{value: depositAmount}("");
-        if (!sent) revert RefundFailed();
-
-        emit DepositForfeited(founder, token, depositAmount);
-    }
-
     // ============================================
-    // VIEW FUNCTIONS
+    // DELEGATECALL FALLBACK
     // ============================================
 
-    function getTokenInfo(address token) external view returns (
-        address escrow,
-        address vesting,
-        address distributor,
-        uint256 pendingLPTokens
-    ) {
-        escrow = tokenToEscrow[token];
-        vesting = tokenToVesting[token];
-        distributor = tokenToDistributor[token];
-        pendingLPTokens = pendingLP[token].tokenAmount;
-    }
-
-    /**
-     * @notice Get deposit info for a token
-     * @param token Token address
-     * @return depositAmount Amount of deposit held (0 if refunded/forfeited)
-     */
-    function getDepositInfo(address token) external view returns (uint256 depositAmount) {
-        depositAmount = tokenDeposits[token];
-    }
-
-    /**
-     * @notice Get current deposit requirement
-     * @return Current founder deposit amount in wei
-     */
-    function getDepositRequirement() external view returns (uint256) {
-        return founderDepositWei;
-    }
-
-    // ============================================
-    // RESCUE
-    // ============================================
-
-    event ETHRescued(address indexed to, uint256 amount);
-
-    /// @notice Rescue accidentally sent ETH from the router
-    /// @param to Recipient address
-    /// @param amount Amount of ETH to rescue
-    function rescueETH(address to, uint256 amount) external onlyOwner {
-        if (to == address(0)) revert ZeroAddress();
-        (bool success, ) = to.call{value: amount}("");
-        require(success, "ETH transfer failed");
-        emit ETHRescued(to, amount);
+    /// @notice Forwards unmatched calls to the extension contract via delegatecall
+    /// @dev Audit fix: pause-guarded to enforce emergency stop on all extension mutations.
+    ///      Use emergencyUnpause() on the router directly to recover from paused state.
+    fallback() external payable whenNotPaused {
+        address ext = extension;
+        assembly ("memory-safe") {
+            calldatacopy(0, 0, calldatasize())
+            let result := delegatecall(gas(), ext, 0, calldatasize(), 0, 0)
+            returndatacopy(0, 0, returndatasize())
+            switch result
+            case 0 { revert(0, returndatasize()) }
+            default { return(0, returndatasize()) }
+        }
     }
 
     // ============================================
     // RECEIVE
     // ============================================
 
-    receive() external payable {}
+    event ETHReceived(address indexed sender, uint256 amount); // Audit fix U-02
+
+    receive() external payable {
+        emit ETHReceived(msg.sender, msg.value); // Audit fix U-02: log arbitrary ETH
+    }
 }

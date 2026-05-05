@@ -75,6 +75,9 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
     /// @notice ETH owed to recipients from failed transfers during batchDistribute
     mapping(address => uint256) public pendingEthRefunds;
 
+    /// @notice Total outstanding ETH refunds (H8 fix: track to protect from sweep)
+    uint256 public totalPendingEthRefunds;
+
     // ============================================
     // ERRORS
     // ============================================
@@ -136,7 +139,7 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
 
     /**
      * @notice Set the merkle root for token + ETH distribution
-     * @dev Merkle leaves are: keccak256(abi.encodePacked(address, tokenAmount, ethRefund))
+     * @dev Merkle leaves are double-hashed: keccak256(abi.encodePacked(keccak256(abi.encodePacked(address, tokenAmount, ethRefund))))
      * @param _merkleRoot Merkle root of (address, tokenAmount, ethRefund) leaves
      * @param _totalTokens Total tokens to be distributed
      * @param _totalEthRefunds Total ETH refunds (for Pro-Rata excess)
@@ -186,7 +189,8 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
         if (tokenAmount == 0 && ethRefund == 0) revert InvalidAmount();
 
         // Verify merkle proof (leaf includes both token amount and ETH refund)
-        bytes32 leaf = keccak256(abi.encodePacked(msg.sender, tokenAmount, ethRefund));
+        // Double-hash to prevent leaf-node collision with intermediate nodes
+        bytes32 leaf = keccak256(abi.encodePacked(keccak256(abi.encodePacked(msg.sender, tokenAmount, ethRefund))));
         if (!MerkleProof.verify(proof, merkleRoot, leaf)) revert InvalidProof();
 
         hasClaimed[msg.sender] = true;
@@ -227,6 +231,7 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
         if (recipients.length != tokenAmounts.length) revert InvalidAmount();
         if (recipients.length != ethRefunds.length) revert InvalidAmount();
         if (recipients.length != proofs.length) revert InvalidAmount();
+        require(recipients.length <= 100, "Batch too large"); // Audit fix L-01
 
         for (uint256 i = 0; i < recipients.length; i++) {
             address recipient = recipients[i];
@@ -237,8 +242,8 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
             if (hasClaimed[recipient]) continue;
             if (tokenAmount == 0 && ethRefund == 0) continue;
 
-            // Verify merkle proof
-            bytes32 leaf = keccak256(abi.encodePacked(recipient, tokenAmount, ethRefund));
+            // Verify merkle proof (double-hash)
+            bytes32 leaf = keccak256(abi.encodePacked(keccak256(abi.encodePacked(recipient, tokenAmount, ethRefund))));
             if (!MerkleProof.verify(proofs[i], merkleRoot, leaf)) continue;
 
             // Always mark as claimed FIRST to prevent double-claim
@@ -260,10 +265,12 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
                 } else {
                     // ETH transfer failed - track for pull-based claim
                     pendingEthRefunds[recipient] = ethRefund;
+                    totalPendingEthRefunds += ethRefund;
                 }
             } else if (ethRefund > 0) {
                 // Insufficient ETH balance - track for pull-based claim
                 pendingEthRefunds[recipient] = ethRefund;
+                totalPendingEthRefunds += ethRefund;
             }
 
             emit TokensClaimed(recipient, tokenAmount, actualEth);
@@ -280,6 +287,7 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
         if (address(this).balance < owed) revert InsufficientEth();
 
         pendingEthRefunds[msg.sender] = 0;
+        totalPendingEthRefunds -= owed;
         totalEthClaimed += owed;
 
         (bool sent, ) = msg.sender.call{value: owed}("");
@@ -304,16 +312,21 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
         uint256 tokenRemaining = token.balanceOf(address(this));
         uint256 ethRemaining = address(this).balance;
 
+        // H8 fix: protect pending ETH refunds from being swept
+        uint256 sweepableEth = ethRemaining > totalPendingEthRefunds
+            ? ethRemaining - totalPendingEthRefunds
+            : 0;
+
         if (tokenRemaining > 0) {
             token.safeTransfer(opsWallet, tokenRemaining);
         }
 
-        if (ethRemaining > 0) {
-            (bool sent, ) = opsWallet.call{value: ethRemaining}("");
+        if (sweepableEth > 0) {
+            (bool sent, ) = opsWallet.call{value: sweepableEth}("");
             if (!sent) revert TransferFailed();
         }
 
-        emit TokensRecovered(opsWallet, tokenRemaining, ethRemaining);
+        emit TokensRecovered(opsWallet, tokenRemaining, sweepableEth);
     }
 
     /**
@@ -350,7 +363,7 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
         if (hasClaimed[account]) return false;
         if (tokenAmount == 0 && ethRefund == 0) return false;
 
-        bytes32 leaf = keccak256(abi.encodePacked(account, tokenAmount, ethRefund));
+        bytes32 leaf = keccak256(abi.encodePacked(keccak256(abi.encodePacked(account, tokenAmount, ethRefund))));
         return MerkleProof.verify(proof, merkleRoot, leaf);
     }
 

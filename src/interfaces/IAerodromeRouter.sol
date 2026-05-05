@@ -69,4 +69,12 @@ interface IAerodromePool {
     function balanceOf(address account) external view returns (uint256);
     function transfer(address to, uint256 amount) external returns (bool);
     function approve(address spender, uint256 amount) external returns (bool);
+
+    /// @notice Claim accrued trading fees for the caller's LP position.
+    /// @dev Pays out (claimed0, claimed1) in token0/token1 to msg.sender, and zeroes out
+    ///      the caller's claimable0/claimable1. Accrual updates on every LP transfer via
+    ///      the pool's _updateFor() hook, so an untouched LP position accrues indefinitely.
+    /// @return claimed0 Amount of token0 transferred to msg.sender
+    /// @return claimed1 Amount of token1 transferred to msg.sender
+    function claimFees() external returns (uint256 claimed0, uint256 claimed1);
 }

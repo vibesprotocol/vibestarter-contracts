@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "./interfaces/ITimeOracle.sol";
 import "./interfaces/IVibesLaunchRouter.sol";
 
@@ -86,6 +87,7 @@ contract VibesTranchEscrow is ReentrancyGuard {
     uint256 public constant MIN_CONTRIBUTION = 0.01 ether;
     uint256 public constant BPS_DENOMINATOR = 10000;
     uint256 public constant NUM_MONTHLY_TRANCHES = 6;
+    uint256 public constant MAX_TIME_DRIFT = 1 hours; // Audit fix H-06: sanity bound on time oracle
 
     // ============ State ============
 
@@ -103,10 +105,17 @@ contract VibesTranchEscrow is ReentrancyGuard {
     mapping(address => bool) public refundClaimedFromMerkle;  // For holder refunds
     mapping(uint8 => bool) public trancheClaimed;
     mapping(uint8 => bool) public trancheChallenged;  // Track if a tranche has already been challenged
+    mapping(uint8 => uint256) public trancheRequestedAt;  // When founder requested payout (starts 72h window)
+
+    // Challenge vote direction per voter per tranche: 0=none, 1=support, 2=oppose
+    mapping(address => mapping(uint8 => uint8)) public challengeVoteDirection;
 
     // Snapshot values for holder refunds (set when campaign is frozen)
     uint256 public frozenEthBalance;
     uint256 public frozenTotalSupply;  // Redeemable supply (excludes permanently locked tokens)
+
+    // Audit fix F4: Track unclaimed pro-rata excess refund liability
+    uint256 public totalExcessRefundLiability;
 
     // LP withdrawal tracking
     bool public lpWithdrawn;
@@ -114,11 +123,36 @@ contract VibesTranchEscrow is ReentrancyGuard {
     address public lpLocker;  // LP locker address for direct LP ETH transfer
     uint256 public lpEthAmount;  // Amount of ETH sent to LP locker during finalization
 
+    // Known locked contract addresses for onchain redeemable supply calculation (audit fix)
+    address public vestingContract;     // Founder vesting contract
+    address public stakerRewards;       // Staker rewards contract
+    address public treasuryContract;    // Audit fix F-2 (2026-04): treasury escrow holds a large illiquid
+                                        // allocation; without exclusion, its balance dilutes holder refunds.
+
     // Effective raised amount (after pro-rata calculations for oversubscribed campaigns)
     uint256 public effectiveRaised;
 
-    // Track total excess refunds claimed (for accurate frozen balance calculation)
-    uint256 public totalExcessClaimed;
+    // Accumulated platform fees (pull pattern — audit fix)
+    uint256 public pendingPlatformFees;
+
+    // EIP-712 terms signature gating
+    address public trustedSigner;        // Backend signer for terms acceptance (address(0) = gating disabled)
+    bytes32 private _DOMAIN_SEPARATOR;   // EIP-712 domain separator (set during initialize)
+
+    // Audit fix H-04: LP creation verified flag — blocks tranche claims until LP is truly locked
+    bool public lpCreated;
+
+    // Per-challenger cooldown to prevent serial challenge griefing (audit response)
+    mapping(address => uint256) public lastChallengeTime;
+    uint256 public constant CHALLENGE_COOLDOWN = 7 days;
+
+    // EIP-712 nonce replay protection — sequential per-user nonce
+    mapping(address => uint256) public nonces;
+
+    // Audit fix F10: Commit-reveal for merkle root — 24hr delay between commit and finalize
+    bytes32 public pendingMerkleRoot;
+    uint256 public merkleRootCommitTime;
+    uint256 public constant MERKLE_ROOT_DELAY = 24 hours;
 
     // ============ Events ============
 
@@ -139,6 +173,7 @@ contract VibesTranchEscrow is ReentrancyGuard {
     event CampaignFrozen(address indexed by, string reason);
     event RefundMerkleRootSet(bytes32 merkleRoot, uint256 snapshotBlock);
 
+    event TrancheRequested(uint8 indexed tranche, uint256 timestamp);
     event TrancheClaimed(uint8 indexed tranche, uint256 amount, uint256 fee);
     event ChallengeRaised(address indexed challenger, uint8 tranche, uint256 stake, string reason);
     event ChallengeUpheld(address indexed challenger, uint8 tranche);
@@ -148,6 +183,7 @@ contract VibesTranchEscrow is ReentrancyGuard {
     event HolderRefund(address indexed holder, uint256 ethAmount, uint256 tokensBurned);
     event ExcessRefund(address indexed contributor, uint256 amount);
     event ChallengeSupported(address indexed supporter, uint8 tranche, string additionalContext);
+    event ChallengeOpposed(address indexed opposer, uint8 tranche, string additionalContext);
     event CampaignCompleted(uint256 totalPaid);
 
     event FounderUpdate(address indexed founder, string ipfsCid, uint256 timestamp);
@@ -156,6 +192,15 @@ contract VibesTranchEscrow is ReentrancyGuard {
     event LPWithdrawn(address indexed lpLocker, uint256 amount);
     event CampaignFinalized(uint256 effectiveRaised, uint256 excessForRefunds);
     event FrozenBalanceRecorded(uint256 ethBalance, uint256 tokenSupply);
+    event LockedAddressesUpdated(address vestingContract, address stakerRewards);
+    event TreasuryContractUpdated(address treasuryContract);
+    event MerkleRootCommitted(bytes32 merkleRoot, uint256 commitTime);
+    event MerkleRootCancelled(bytes32 merkleRoot);
+    event PlatformFeesAccrued(uint8 indexed tranche, uint256 amount);
+    event PlatformFeesClaimed(address indexed claimedBy, uint256 amount);
+    event TrustedSignerUpdated(address indexed oldSigner, address indexed newSigner);
+    event FinalizationDeferred(address indexed token, bytes reason); // Phase 1 (LP) failed
+    event DistributionDeferred(address indexed token, bytes reason); // Phase 2 (distribution) failed
 
     // ============ Errors ============
 
@@ -184,9 +229,23 @@ contract VibesTranchEscrow is ReentrancyGuard {
     error LPAlreadyWithdrawn();
     error OnlyRouter();
     error ChallengeWindowOpen();
+    error TrancheNotRequested();
+    error TrancheAlreadyRequested();
     error TrancheAlreadyChallenged();
     error CampaignCompleteCannotFreeze();
     error RaiseNotStarted();
+    error SignatureExpired();
+    error InvalidSignature();
+    error UseContributeFunction();
+    error ChallengeCooldownActive();
+    error LPNotCreated();  // Audit fix H-04: tranche claims blocked until LP is verified created
+    error InvalidNonce();
+    error MerkleRootDelayNotElapsed();
+    error NoPendingMerkleRoot();
+
+    // ============ Constants (EIP-712) ============
+
+    bytes32 public constant TERMS_TYPEHASH = keccak256("TermsAcceptance(address user,uint256 nonce,uint256 deadline)");
 
     // ============ Modifiers ============
 
@@ -202,6 +261,11 @@ contract VibesTranchEscrow is ReentrancyGuard {
 
     modifier inState(CampaignState _state) {
         if (campaign.state != _state) revert InvalidState(campaign.state, _state);
+        _;
+    }
+
+    modifier requiresTermsSignature(uint256 nonce, uint256 deadline, bytes calldata signature) {
+        _verifyTermsSignature(msg.sender, nonce, deadline, signature);
         _;
     }
 
@@ -225,6 +289,8 @@ contract VibesTranchEscrow is ReentrancyGuard {
     /// @param _platformWallet Platform fee wallet
     /// @param _timeOracle Time oracle (0x0 for production)
     /// @param _authorizedRouter Router authorized to withdraw LP funds
+    /// @param _lpLocker LP locker address
+    /// @param _trustedSigner Backend signer for terms acceptance (address(0) = gating disabled)
     function initialize(
         address _founder,
         address _token,
@@ -237,7 +303,8 @@ contract VibesTranchEscrow is ReentrancyGuard {
         address _platformWallet,
         address _timeOracle,
         address _authorizedRouter,
-        address _lpLocker
+        address _lpLocker,
+        address _trustedSigner
     ) external {
         if (_initialized) revert AlreadyInitialized();
         _initialized = true;
@@ -253,6 +320,18 @@ contract VibesTranchEscrow is ReentrancyGuard {
         timeOracle = _timeOracle;
         authorizedRouter = _authorizedRouter;
         lpLocker = _lpLocker;
+        trustedSigner = _trustedSigner;
+
+        // Compute EIP-712 domain separator
+        _DOMAIN_SEPARATOR = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("VibesTranchEscrow"),
+                keccak256("1"),
+                block.chainid,
+                address(this)
+            )
+        );
 
         campaign = Campaign({
             founder: _founder,
@@ -280,44 +359,88 @@ contract VibesTranchEscrow is ReentrancyGuard {
         if (timeOracle == address(0)) {
             return block.timestamp;
         }
-        return ITimeOracle(timeOracle).getTime();
+        uint256 oracleTime = ITimeOracle(timeOracle).getTime();
+        // Audit fix H-06: Prevent malicious oracle from jumping time forward
+        require(oracleTime <= block.timestamp + MAX_TIME_DRIFT, "Oracle drift exceeded");
+        return oracleTime;
+    }
+
+    /// @notice Public accessor for effective current time (audit fix F8)
+    /// @dev Used by router for auto-finalization deadline check so it respects the time oracle
+    function currentTime() external view returns (uint256) {
+        return _currentTime();
     }
 
     // ============ Supply Helper ============
 
-    /// @dev Calculate redeemable token supply (excludes permanently locked tokens)
-    /// @param _excludeAddresses Addresses holding non-redeemable tokens (vesting, staker rewards, router, 0xdead)
-    function _calculateRedeemableSupply(address[] memory _excludeAddresses) internal view returns (uint256) {
+    /// @dev Calculate redeemable token supply using known locked contract addresses
+    /// @notice Excludes tokens held by: dead address (LP), vesting, staker rewards, router, LP locker, and this escrow
+    function _calculateRedeemableSupply() internal view returns (uint256) {
         IERC20 token = IERC20(campaign.token);
         uint256 totalSupply = token.totalSupply();
         uint256 excludedBalance = 0;
 
-        for (uint256 i = 0; i < _excludeAddresses.length; i++) {
-            if (_excludeAddresses[i] != address(0)) {
-                excludedBalance += token.balanceOf(_excludeAddresses[i]);
-            }
-        }
-
-        // Also always exclude the dead address (LP tokens)
+        // Always exclude the dead address (permanently locked LP tokens)
         excludedBalance += token.balanceOf(address(0x000000000000000000000000000000000000dEaD));
+
+        // Exclude known locked contracts (set via setLockedAddresses or at init)
+        if (vestingContract != address(0)) {
+            excludedBalance += token.balanceOf(vestingContract);
+        }
+        if (stakerRewards != address(0)) {
+            excludedBalance += token.balanceOf(stakerRewards);
+        }
+        if (authorizedRouter != address(0)) {
+            excludedBalance += token.balanceOf(authorizedRouter);
+        }
+        if (lpLocker != address(0)) {
+            excludedBalance += token.balanceOf(lpLocker);
+        }
+        // Audit fix F-2 (2026-04): exclude the treasury escrow — its allocation is custody, not circulating supply.
+        if (treasuryContract != address(0)) {
+            excludedBalance += token.balanceOf(treasuryContract);
+        }
+        // Exclude tokens held by this escrow itself (e.g., challenge stakes)
+        excludedBalance += token.balanceOf(address(this));
 
         return totalSupply > excludedBalance ? totalSupply - excludedBalance : 0;
     }
 
-    // ============ Pending Excess Helper ============
+    // ============ EIP-712 Signature Verification ============
 
-    /// @dev Calculate pending (unclaimed) ProRata excess refunds
-    function _pendingExcessRefunds() internal view returns (uint256) {
-        if (campaign.raiseType != RaiseType.ProRata) return 0;
-        if (campaign.totalCommitted <= campaign.goal) return 0;
-        uint256 totalExcess = campaign.totalRaised - effectiveRaised;
-        return totalExcess > totalExcessClaimed ? totalExcess - totalExcessClaimed : 0;
+    /// @notice Verify that the backend trusted signer authorized this user
+    /// @dev If trustedSigner is address(0), gating is disabled (backwards compatible)
+    /// @dev Nonce must match current value for user; incremented after successful verification
+    function _verifyTermsSignature(address user, uint256 nonce, uint256 deadline, bytes calldata signature) internal {
+        if (trustedSigner == address(0)) return; // Gating disabled
+
+        if (nonce != nonces[user]) revert InvalidNonce();
+        if (block.timestamp > deadline) revert SignatureExpired();
+
+        bytes32 structHash = keccak256(abi.encode(TERMS_TYPEHASH, user, nonce, deadline));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", _DOMAIN_SEPARATOR, structHash));
+
+        address recovered = ECDSA.recover(digest, signature);
+        if (recovered != trustedSigner) revert InvalidSignature();
+
+        nonces[user]++;
+    }
+
+    /// @notice Update the trusted signer address (admin only)
+    /// @param _newSigner New signer address (address(0) disables gating)
+    function setTrustedSigner(address _newSigner) external onlyAdmin {
+        address oldSigner = trustedSigner;
+        trustedSigner = _newSigner;
+        emit TrustedSignerUpdated(oldSigner, _newSigner);
     }
 
     // ============ Contribution Functions ============
 
     /// @notice Contribute ETH to the campaign
-    function contribute() external payable nonReentrant {
+    /// @param nonce Sequential nonce for replay protection
+    /// @param deadline Signature expiry timestamp
+    /// @param signature EIP-712 signature from trusted signer
+    function contribute(uint256 nonce, uint256 deadline, bytes calldata signature) external payable nonReentrant requiresTermsSignature(nonce, deadline, signature) {
         _contribute(msg.sender, msg.value);
     }
 
@@ -371,6 +494,11 @@ contract VibesTranchEscrow is ReentrancyGuard {
             // Calculate effective raised amount (handles pro-rata oversubscription)
             _calculateEffectiveRaised();
 
+            // Audit fix F4: Track total excess refund liability for pro-rata raises
+            if (campaign.raiseType == RaiseType.ProRata && campaign.totalCommitted > campaign.goal) {
+                totalExcessRefundLiability = campaign.totalCommitted - campaign.goal;
+            }
+
             // Send LP ETH to the router (avoids router needing to call back into escrow)
             uint256 lpAmount = getLPAmount();
             if (lpAmount > 0 && authorizedRouter != address(0)) {
@@ -385,8 +513,18 @@ contract VibesTranchEscrow is ReentrancyGuard {
 
             // Complete finalization via router: creates LP from forwarded ETH, distributes tokens
             // Router no longer calls back into escrow (LP ETH already forwarded above)
+            // Audit fix H-02: try/catch so finalization completes even if router is paused
             if (authorizedRouter != address(0)) {
-                IVibesLaunchRouter(authorizedRouter).completeFinalization(campaign.token);
+                // Phase 1: LP creation (~800K gas)
+                try IVibesLaunchRouter(authorizedRouter).completeFinalization(campaign.token) {
+                } catch (bytes memory reason) {
+                    emit FinalizationDeferred(campaign.token, reason);
+                }
+                // Phase 2: Distribution (~400K gas)
+                try IVibesLaunchRouter(authorizedRouter).completeDistribution(campaign.token) {
+                } catch (bytes memory reason) {
+                    emit DistributionDeferred(campaign.token, reason);
+                }
             }
         } else {
             campaign.state = CampaignState.Failed;
@@ -420,8 +558,8 @@ contract VibesTranchEscrow is ReentrancyGuard {
             // Must have at least some contributions, and either no soft cap OR soft cap reached
             return campaign.totalRaised > 0 && (campaign.softCap == 0 || campaign.totalRaised >= campaign.softCap);
         } else {
-            // ProRata: always succeeds if any contributions (goal is hard cap)
-            return campaign.totalRaised > 0;
+            // ProRata: must reach the hard cap (goal) to be funded
+            return campaign.totalRaised >= campaign.goal;
         }
     }
 
@@ -439,9 +577,9 @@ contract VibesTranchEscrow is ReentrancyGuard {
     /// @notice Get the amount for a specific tranche
     /// @param _tranche Tranche number (0 = kickstart, 1-6 = monthly)
     function getTrancheAmount(uint8 _tranche) public view returns (uint256) {
-        // Calculate escrow amount (80% of effective raised, 20% goes to LP)
+        // Calculate escrow amount (85% of effective raised, 15% goes to LP)
         // effectiveRaised accounts for pro-rata excess that stays for refunds
-        uint256 escrowAmount = (effectiveRaised * 8000) / BPS_DENOMINATOR;
+        uint256 escrowAmount = (effectiveRaised * 8500) / BPS_DENOMINATOR;
 
         if (_tranche == 0) {
             return (escrowAmount * KICKSTART_BPS) / BPS_DENOMINATOR;
@@ -449,14 +587,42 @@ contract VibesTranchEscrow is ReentrancyGuard {
         return (escrowAmount * MONTHLY_BPS) / BPS_DENOMINATOR;
     }
 
-    /// @notice Get the amount of ETH designated for LP creation (20% of effective raised)
+    /// @notice Get the amount of ETH designated for LP creation (15% of effective raised)
     function getLPAmount() public view returns (uint256) {
-        return (effectiveRaised * 2000) / BPS_DENOMINATOR;
+        return (effectiveRaised * 1500) / BPS_DENOMINATOR;
     }
 
     /// @notice Get total number of tranches (1 kickstart + 6 monthly)
     function getTotalTranches() external pure returns (uint8) {
         return 1 + uint8(NUM_MONTHLY_TRANCHES); // 7 total
+    }
+
+    /// @notice Request payout for a monthly tranche (founder only) — starts 72h challenge window
+    /// @param _tranche Tranche number to request (1-6, kickstart is claimed directly)
+    function requestTranche(uint8 _tranche) external onlyFounder inState(CampaignState.Funded) {
+        if (_tranche == 0) revert InvalidTranche(); // Kickstart doesn't need a request
+        if (_tranche > NUM_MONTHLY_TRANCHES) revert InvalidTranche();
+        if (trancheClaimed[_tranche]) revert TrancheAlreadyClaimed(_tranche);
+        if (trancheRequestedAt[_tranche] > 0) revert TrancheAlreadyRequested();
+
+        // Auto-expire stale challenges so founders aren't blocked by timed-out disputes
+        _expireChallengeIfNeeded();
+        if (activeChallenge.state == ChallengeState.Pending) revert ChallengePending();
+
+        // Audit fix F5: LP must be actually created (not just withdrawn) before tranches can be requested.
+        // Previously checked lpWithdrawn, but in deferred LP scenarios (lpWithdrawn=true, lpCreated=false),
+        // this allowed requests that would later fail on claim, creating confusing state.
+        if (!lpCreated && authorizedRouter != address(0)) revert LPNotCreated();
+
+        uint256 unlockTime = getTrancheUnlockTime(_tranche);
+        if (_currentTime() < unlockTime) revert TrancheNotReady(_tranche, unlockTime);
+
+        // Must request in order
+        if (_tranche != campaign.nextTranche) revert TrancheNotReady(_tranche, unlockTime);
+
+        trancheRequestedAt[_tranche] = _currentTime();
+
+        emit TrancheRequested(_tranche, _currentTime());
     }
 
     /// @notice Claim a tranche (founder only)
@@ -465,7 +631,12 @@ contract VibesTranchEscrow is ReentrancyGuard {
         if (_tranche > NUM_MONTHLY_TRANCHES) revert InvalidTranche();
         if (trancheClaimed[_tranche]) revert TrancheAlreadyClaimed(_tranche);
 
-        // Check no pending challenge
+        // Audit fix H-04: Block tranche claims if LP was not created (rescue scenario)
+        if (!lpCreated && authorizedRouter != address(0)) revert LPNotCreated();
+
+        // Auto-expire stale challenges before checking — prevents founders from being
+        // permanently blocked by challenges that exceeded the window without admin action.
+        _expireChallengeIfNeeded();
         if (activeChallenge.state == ChallengeState.Pending) revert ChallengePending();
 
         // LP must be created before any tranches can be claimed
@@ -477,9 +648,13 @@ contract VibesTranchEscrow is ReentrancyGuard {
         // Must claim in order
         if (_tranche != campaign.nextTranche) revert TrancheNotReady(_tranche, unlockTime);
 
-        // Enforce 72-hour challenge window after unlock time
-        uint256 claimableTime = unlockTime + CHALLENGE_WINDOW;
-        if (_currentTime() < claimableTime) revert ChallengeWindowOpen();
+        // Kickstart (tranche 0) has no challenge window — available immediately on completion.
+        // Monthly tranches (1-6) require requestTranche() first, then 72h challenge window.
+        if (_tranche > 0) {
+            if (trancheRequestedAt[_tranche] == 0) revert TrancheNotRequested();
+            uint256 claimableTime = trancheRequestedAt[_tranche] + CHALLENGE_WINDOW;
+            if (_currentTime() <= claimableTime) revert ChallengeWindowOpen(); // Audit fix H-01: strictly after window
+        }
 
         uint256 amount = getTrancheAmount(_tranche);
         uint256 fee = (amount * PLATFORM_FEE_BPS) / BPS_DENOMINATOR;
@@ -488,14 +663,15 @@ contract VibesTranchEscrow is ReentrancyGuard {
         trancheClaimed[_tranche] = true;
         campaign.nextTranche = _tranche + 1;
 
-        // Transfer fee to platform
-        (bool feeSuccess, ) = platformWallet.call{value: fee}("");
-        require(feeSuccess, "Fee transfer failed");
+        // Accrue platform fee for later withdrawal (pull pattern — audit fix)
+        // This ensures a reverting platformWallet cannot DoS the founder.
+        pendingPlatformFees += fee;
 
         // Transfer to founder
         (bool success, ) = campaign.founder.call{value: founderAmount}("");
         require(success, "Founder transfer failed");
 
+        emit PlatformFeesAccrued(_tranche, fee);
         emit TrancheClaimed(_tranche, founderAmount, fee);
 
         // Transition to Completed after last tranche
@@ -523,17 +699,62 @@ contract VibesTranchEscrow is ReentrancyGuard {
         if (activeChallenge.state == ChallengeState.Pending) {
             return (false, "Challenge pending");
         }
-        if (!lpWithdrawn) {
+        // Audit fix F5 (view alignment): mirror claimTranche — lpCreated, not lpWithdrawn.
+        // In deferred-LP scenarios (lpWithdrawn=true, lpCreated=false), the previous
+        // check returned a false-positive and integrators saw "claim ready" while the
+        // actual claimTranche would revert with LPNotCreated.
+        if (!lpCreated && authorizedRouter != address(0)) {
             return (false, "LP not yet created");
         }
         uint256 unlockTime = getTrancheUnlockTime(_tranche);
         if (_currentTime() < unlockTime) {
             return (false, "Not yet unlocked");
         }
-        // Check 72-hour challenge window has passed
-        uint256 claimableTime = unlockTime + CHALLENGE_WINDOW;
-        if (_currentTime() < claimableTime) {
-            return (false, "Challenge window still open");
+        // Kickstart (tranche 0) has no challenge window — available immediately.
+        // Monthly tranches (1-6) require requestTranche() first, then 72h challenge window.
+        if (_tranche > 0) {
+            if (trancheRequestedAt[_tranche] == 0) {
+                return (false, "Payout not yet requested");
+            }
+            uint256 claimableTime = trancheRequestedAt[_tranche] + CHALLENGE_WINDOW;
+            if (_currentTime() <= claimableTime) { // Must match claimTranche boundary (strictly after)
+                return (false, "Challenge window still open");
+            }
+        }
+        return (true, "");
+    }
+
+    /// @notice Check if a tranche can be requested (monthly only, not yet requested)
+    /// @param _tranche Tranche number
+    function canRequestTranche(uint8 _tranche) external view returns (bool, string memory) {
+        if (campaign.state != CampaignState.Funded) {
+            return (false, "Campaign not funded");
+        }
+        if (_tranche == 0) {
+            return (false, "Kickstart does not need request");
+        }
+        if (_tranche > NUM_MONTHLY_TRANCHES) {
+            return (false, "Invalid tranche");
+        }
+        if (trancheClaimed[_tranche]) {
+            return (false, "Already claimed");
+        }
+        if (trancheRequestedAt[_tranche] > 0) {
+            return (false, "Already requested");
+        }
+        if (_tranche != campaign.nextTranche) {
+            return (false, "Must request in order");
+        }
+        if (activeChallenge.state == ChallengeState.Pending) {
+            return (false, "Challenge pending");
+        }
+        // Audit fix F5: Align with requestTranche — check lpCreated, not lpWithdrawn
+        if (!lpCreated && authorizedRouter != address(0)) {
+            return (false, "LP not yet created");
+        }
+        uint256 unlockTime = getTrancheUnlockTime(_tranche);
+        if (_currentTime() < unlockTime) {
+            return (false, "Not yet unlocked");
         }
         return (true, "");
     }
@@ -552,17 +773,27 @@ contract VibesTranchEscrow is ReentrancyGuard {
     /// @notice Raise a challenge against the current claimable tranche
     /// @dev Challenger must hold >= 0.5% of token supply
     /// @param _reason Description of why the challenge is being raised
-    function raiseChallenge(string calldata _reason) external nonReentrant inState(CampaignState.Funded) {
+    /// @param nonce Sequential nonce for replay protection
+    /// @param deadline Signature expiry timestamp
+    /// @param signature EIP-712 signature from trusted signer
+    function raiseChallenge(string calldata _reason, uint256 nonce, uint256 deadline, bytes calldata signature) external nonReentrant inState(CampaignState.Funded) requiresTermsSignature(nonce, deadline, signature) {
         if (activeChallenge.state == ChallengeState.Pending) revert ChallengePending();
 
         uint8 tranche = campaign.nextTranche;
         if (tranche > NUM_MONTHLY_TRANCHES) revert InvalidTranche();
+        if (tranche == 0) revert InvalidTranche(); // Kickstart cannot be challenged
         if (trancheClaimed[tranche]) revert TrancheAlreadyClaimed(tranche);
         if (trancheChallenged[tranche]) revert TrancheAlreadyChallenged();
 
-        // Check unlock time has passed (can only challenge when tranche is claimable)
-        uint256 unlockTime = getTrancheUnlockTime(tranche);
-        if (_currentTime() < unlockTime) revert TrancheNotReady(tranche, unlockTime);
+        // Per-challenger cooldown to prevent serial challenge griefing
+        if (_currentTime() < lastChallengeTime[msg.sender] + CHALLENGE_COOLDOWN) revert ChallengeCooldownActive();
+
+        // Tranche must have been requested by founder (starts 72h challenge window)
+        if (trancheRequestedAt[tranche] == 0) revert TrancheNotRequested();
+
+        // Challenge must be raised within the 72h window
+        uint256 windowEnd = trancheRequestedAt[tranche] + CHALLENGE_WINDOW;
+        if (_currentTime() >= windowEnd) revert ChallengeWindowClosed(); // Audit fix H-01: blocked at-or-after boundary
 
         // Check challenger has enough tokens (graduated threshold by tranche)
         IERC20 token = IERC20(campaign.token);
@@ -577,6 +808,7 @@ contract VibesTranchEscrow is ReentrancyGuard {
         token.safeTransferFrom(msg.sender, address(this), requiredTokens);
 
         trancheChallenged[tranche] = true;
+        lastChallengeTime[msg.sender] = _currentTime();
 
         activeChallenge = Challenge({
             challenger: msg.sender,
@@ -593,15 +825,32 @@ contract VibesTranchEscrow is ReentrancyGuard {
     /// @notice Support an existing pending challenge with additional context
     /// @dev Allows other backers to strengthen a challenge without creating a new one
     /// @param _additionalContext Additional evidence or reasoning
-    function supportChallenge(string calldata _additionalContext) external inState(CampaignState.Funded) {
+    /// @param nonce Sequential nonce for replay protection
+    /// @param deadline Signature expiry timestamp
+    /// @param signature EIP-712 signature from trusted signer
+    function supportChallenge(string calldata _additionalContext, uint256 nonce, uint256 deadline, bytes calldata signature) external inState(CampaignState.Funded) requiresTermsSignature(nonce, deadline, signature) {
         if (activeChallenge.state != ChallengeState.Pending) revert NoChallengeActive();
+        require(IERC20(campaign.token).balanceOf(msg.sender) > 0, "Not a token holder");
+        uint8 tranche = uint8(activeChallenge.tranche);
+        require(challengeVoteDirection[msg.sender][tranche] != 1, "Already voted support");
+        challengeVoteDirection[msg.sender][tranche] = 1;
+        emit ChallengeSupported(msg.sender, tranche, _additionalContext);
+    }
 
-        emit ChallengeSupported(msg.sender, uint8(activeChallenge.tranche), _additionalContext);
+    /// @notice Token holder signals opposition to an active challenge
+    /// @dev Caller must hold project tokens. Vote can be changed from oppose to support.
+    function opposeChallenge(string calldata _additionalContext, uint256 nonce, uint256 deadline, bytes calldata signature) external inState(CampaignState.Funded) requiresTermsSignature(nonce, deadline, signature) {
+        if (activeChallenge.state != ChallengeState.Pending) revert NoChallengeActive();
+        require(IERC20(campaign.token).balanceOf(msg.sender) > 0, "Not a token holder");
+        uint8 tranche = uint8(activeChallenge.tranche);
+        require(challengeVoteDirection[msg.sender][tranche] != 2, "Already voted oppose");
+        challengeVoteDirection[msg.sender][tranche] = 2;
+        emit ChallengeOpposed(msg.sender, tranche, _additionalContext);
     }
 
     /// @notice Admin upholds the challenge - freezes campaign
-    /// @param _excludeAddresses Addresses holding non-redeemable tokens (vesting, staker rewards, router)
-    function upholdChallenge(address[] calldata _excludeAddresses) external onlyAdmin {
+    /// @dev Redeemable supply is now calculated onchain from known locked addresses (audit fix)
+    function upholdChallenge() external onlyAdmin {
         if (activeChallenge.state != ChallengeState.Pending) revert NoChallengeActive();
 
         activeChallenge.state = ChallengeState.Upheld;
@@ -609,11 +858,17 @@ contract VibesTranchEscrow is ReentrancyGuard {
         campaign.snapshotBlock = block.number;
 
         // Record frozen balances for holder refund calculations
-        // Use redeemable supply (excludes LP at 0xdead, vesting, staker rewards, router)
-        // Subtract pending excess refunds to avoid double-counting ProRata overpayments
-        uint256 pendingExcess = _pendingExcessRefunds();
-        frozenEthBalance = address(this).balance - pendingExcess;
-        frozenTotalSupply = _calculateRedeemableSupply(_excludeAddresses);
+        // Redeemable supply calculated onchain (excludes LP at 0xdead, vesting, staker rewards, router, locker)
+        // Audit fix F4: Subtract unclaimed pro-rata excess liability — that ETH belongs to oversubscribed contributors
+        // Audit fix M-03: Subtract pendingPlatformFees — those belong to the platform, not holders
+        // Audit fix F6: Safe subtraction to prevent underflow revert when balance is depleted
+        {
+            uint256 liabilities = totalExcessRefundLiability + pendingPlatformFees;
+            uint256 balance = address(this).balance;
+            frozenEthBalance = balance > liabilities ? balance - liabilities : 0;
+        }
+        frozenTotalSupply = _calculateRedeemableSupply();
+        require(frozenTotalSupply > 0, "No redeemable supply"); // Audit fix: prevent division by zero in claimHolderRefund
 
         // Return stake to challenger
         IERC20(campaign.token).safeTransfer(activeChallenge.challenger, activeChallenge.amount);
@@ -646,6 +901,11 @@ contract VibesTranchEscrow is ReentrancyGuard {
 
     /// @notice Check if challenge window has expired (auto-reject after 72hr if no action)
     function expireChallengeIfNeeded() external {
+        _expireChallengeIfNeeded();
+    }
+
+    /// @dev Internal version so claimTranche/requestTranche can auto-expire stale challenges
+    function _expireChallengeIfNeeded() internal {
         if (activeChallenge.state != ChallengeState.Pending) return;
 
         if (_currentTime() > activeChallenge.timestamp + CHALLENGE_WINDOW) {
@@ -682,30 +942,196 @@ contract VibesTranchEscrow is ReentrancyGuard {
 
     /// @notice Freeze raise after funding (for abandoned projects)
     /// @dev Cannot freeze a completed raise (all tranches claimed)
+    /// @dev Redeemable supply is now calculated onchain from known locked addresses (audit fix)
+    /// @dev If no tokens are in holder hands (redeemable supply == 0), falls through to Failed
+    ///      state to enable contributor refunds — the holder refund flow is impossible without holders.
     /// @param _reason Reason for freezing
-    /// @param _excludeAddresses Addresses holding non-redeemable tokens (vesting, staker rewards, router)
-    function freezeCampaign(string calldata _reason, address[] calldata _excludeAddresses) external onlyAdmin inState(CampaignState.Funded) {
+    function freezeCampaign(string calldata _reason) external onlyAdmin inState(CampaignState.Funded) {
         if (campaign.nextTranche > NUM_MONTHLY_TRANCHES) revert CampaignCompleteCannotFreeze();
-        campaign.state = CampaignState.Frozen;
+
         campaign.snapshotBlock = block.number;
+        uint256 redeemableSupply = _calculateRedeemableSupply();
 
-        // Record frozen balances for holder refund calculations
-        // Use redeemable supply (excludes LP at 0xdead, vesting, staker rewards, router)
-        // Subtract pending excess refunds to avoid double-counting ProRata overpayments
-        uint256 pendingExcess = _pendingExcessRefunds();
-        frozenEthBalance = address(this).balance - pendingExcess;
-        frozenTotalSupply = _calculateRedeemableSupply(_excludeAddresses);
-
-        emit FrozenBalanceRecorded(frozenEthBalance, frozenTotalSupply);
-        emit CampaignFrozen(msg.sender, _reason);
+        if (redeemableSupply == 0) {
+            // No tokens in holder hands — holder refund flow is impossible.
+            // Fall through to Failed state so contributors can claim ETH refunds directly.
+            // Audit fix F-1 (2026-04): solvency check — without this, a freeze after
+            // `lpWithdrawn` transitions to Failed while the escrow is underfunded, and
+            // early claimers of claimContributorRefund() drain the contract, leaving
+            // later claimers to revert on insufficient balance. Mirrors emergencyRefundFunded().
+            uint256 totalLiability = campaign.totalRaised;
+            if (totalExcessRefundLiability > 0) {
+                totalLiability -= totalExcessRefundLiability;
+            }
+            if (pendingPlatformFees > 0) {
+                totalLiability -= pendingPlatformFees;
+            }
+            require(address(this).balance >= totalLiability, "Insufficient balance - top up first");
+            campaign.state = CampaignState.Failed;
+            emit CampaignFailed(campaign.totalRaised, campaign.goal);
+            emit CampaignFrozen(msg.sender, _reason);
+        } else {
+            // Normal freeze: record snapshot for holder refund calculations
+            campaign.state = CampaignState.Frozen;
+            // Audit fix F4: Subtract unclaimed pro-rata excess liability — that ETH belongs to oversubscribed contributors
+            // Audit fix M-03: Subtract pendingPlatformFees — those belong to the platform, not holders
+            // Audit fix F6: Safe subtraction to prevent underflow revert when balance is depleted
+            {
+                uint256 liabilities = totalExcessRefundLiability + pendingPlatformFees;
+                uint256 balance = address(this).balance;
+                frozenEthBalance = balance > liabilities ? balance - liabilities : 0;
+            }
+            frozenTotalSupply = redeemableSupply;
+            emit FrozenBalanceRecorded(frozenEthBalance, frozenTotalSupply);
+            emit CampaignFrozen(msg.sender, _reason);
+        }
     }
 
-    /// @notice Set merkle root for holder refunds (after freeze)
+    /// @notice Emergency refund for funded raises where finalization failed
+    /// @dev Only callable when LP was never created (completeFinalization failed in try/catch).
+    ///      Moves state to Failed, enabling claimContributorRefund() for backers.
+    ///      Audit fix F3: Requires escrow balance to cover all contributor refund liabilities.
+    ///      If lpWithdrawn is true (LP ETH sent to router but LP creation failed), admin must
+    ///      first top up the escrow via adminTopUp() before calling this.
+    function emergencyRefundFunded() external onlyAdmin inState(CampaignState.Funded) {
+        require(!lpCreated, "LP exists - use freezeCampaign instead");
+
+        // Audit fix H-3: Router must not have progressed finalization. Otherwise a partial
+        // finalization (e.g. Phase 1 completed but Phase 2 queued) could coexist with an
+        // admin-triggered rollback to Failed, opening a token+ETH double-dip window. We
+        // call the router's public finalizationPhase() getter via the interface and require
+        // it returns 0 (None). Wrapped in try/catch so a misconfigured router fails closed
+        // rather than bricking the emergency path entirely (existence of the getter is a
+        // mainnet-deployment precondition; testnet legacy routers without the selector fall
+        // through to the require).
+        try IVibesLaunchRouter(authorizedRouter).finalizationPhase(campaign.token) returns (uint8 phase) {
+            require(phase == 0, "Router finalization progressed");
+        } catch {
+            // Pre-migration router without selector: best-effort fallback — do not block
+            // emergency rescue (legacy escrows that never went through two-phase finalize).
+        }
+
+        // Audit fix F3: Solvency check — escrow must hold enough ETH to cover all contributor refunds.
+        // totalExcessRefundLiability = unclaimed pro-rata excess (those users get reduced refund via F1 fix).
+        // pendingPlatformFees = accrued fees not yet claimed (belong to platform, not contributors).
+        // Without this check, early claimants succeed but later ones revert on insufficient balance.
+        uint256 totalLiability = campaign.totalRaised;
+        if (totalExcessRefundLiability > 0) {
+            totalLiability -= totalExcessRefundLiability;
+        }
+        if (pendingPlatformFees > 0) {
+            totalLiability -= pendingPlatformFees;
+        }
+        require(address(this).balance >= totalLiability, "Insufficient balance - top up first");
+
+        campaign.state = CampaignState.Failed;
+        emit CampaignFailed(campaign.totalRaised, campaign.goal);
+    }
+
+    /// @notice Allow admin to top up escrow ETH for emergency recovery
+    /// @dev Audit fix F2: Required when LP ETH was forwarded out during finalize() but campaign
+    ///      needs to revert to Failed state. The receive() function intentionally rejects plain
+    ///      ETH transfers to prevent accidental sends, so this explicit function is needed.
+    event EscrowToppedUp(address indexed sender, uint256 amount);
+
+    function adminTopUp() external payable onlyAdmin {
+        require(msg.value > 0, "Zero value");
+        emit EscrowToppedUp(msg.sender, msg.value);
+    }
+
+    /// @notice Claim accumulated platform fees (pull pattern — audit fix)
+    /// @dev Anyone can call, but fees always go to platformWallet. Uses pull pattern so a
+    ///      reverting platformWallet cannot block founder tranche claims.
+    function claimPlatformFees() external nonReentrant {
+        require(
+            campaign.state != CampaignState.Frozen &&
+            campaign.state != CampaignState.Refunding,
+            "Fees locked during refund"
+        );
+        uint256 fees = pendingPlatformFees;
+        require(fees > 0, "No pending fees");
+
+        pendingPlatformFees = 0;
+
+        (bool success, ) = platformWallet.call{value: fees}("");
+        require(success, "Fee transfer failed");
+
+        emit PlatformFeesClaimed(msg.sender, fees);
+    }
+
+    /// @notice Mark LP as created (called by router after backup finalization resolves LP)
+    /// @dev Audit fix H-04: Allows tranche claims after deferred LP is resolved
+    function setLPCreated() external {
+        if (msg.sender != authorizedRouter) revert OnlyRouter();
+        lpCreated = true;
+    }
+
+    /// @notice Set known locked contract addresses for redeemable supply calculation
+    /// @dev These addresses are excluded when calculating frozenTotalSupply (audit fix)
+    /// @param _vestingContract Founder vesting contract address
+    /// @param _stakerRewards Staker rewards contract address
+    function setLockedAddresses(address _vestingContract, address _stakerRewards) external {
+        if (msg.sender != admin && msg.sender != authorizedRouter) revert OnlyAdmin();
+        // Audit fix M-02: Prevent overlapping addresses that would double-count excluded balances
+        if (_vestingContract != address(0) && _stakerRewards != address(0)) {
+            require(_vestingContract != _stakerRewards, "Overlapping locked addresses");
+        }
+        vestingContract = _vestingContract;
+        stakerRewards = _stakerRewards;
+        emit LockedAddressesUpdated(_vestingContract, _stakerRewards);
+    }
+
+    /// @notice Set the treasury escrow address (audit fix F-2, 2026-04)
+    /// @dev Treasury token balance must be excluded from redeemable supply so it does not
+    ///      dilute per-holder ETH refunds on freeze. Separate from setLockedAddresses to
+    ///      preserve backwards-compatible signatures for existing callers and tests.
+    ///      Callable by admin or the authorized router (router wires this during Phase 2).
+    /// @param _treasuryContract Treasury escrow address (pass address(0) to unset).
+    function setTreasuryContract(address _treasuryContract) external {
+        if (msg.sender != admin && msg.sender != authorizedRouter) revert OnlyAdmin();
+        // Prevent overlapping addresses that would double-count excluded balances
+        if (_treasuryContract != address(0)) {
+            require(_treasuryContract != vestingContract, "Overlaps vesting");
+            require(_treasuryContract != stakerRewards, "Overlaps stakerRewards");
+            require(_treasuryContract != lpLocker, "Overlaps lpLocker");
+            require(_treasuryContract != authorizedRouter, "Overlaps router");
+            require(_treasuryContract != address(this), "Overlaps escrow");
+        }
+        treasuryContract = _treasuryContract;
+        emit TreasuryContractUpdated(_treasuryContract);
+    }
+
+    /// @notice Commit a merkle root for holder refunds (step 1 of 2)
+    /// @dev Audit fix F10: 24hr delay between commit and finalize so users can verify the tree.
+    ///      A compromised admin cannot instantly set an arbitrary root and drain frozen funds.
     /// @param _merkleRoot Merkle root of holder balances at snapshot
-    function setRefundMerkleRoot(bytes32 _merkleRoot) external onlyAdmin inState(CampaignState.Frozen) {
-        campaign.refundMerkleRoot = _merkleRoot;
+    function commitRefundMerkleRoot(bytes32 _merkleRoot) external onlyAdmin inState(CampaignState.Frozen) {
+        require(_merkleRoot != bytes32(0), "Empty merkle root");
+        pendingMerkleRoot = _merkleRoot;
+        merkleRootCommitTime = block.timestamp;
+        emit MerkleRootCommitted(_merkleRoot, block.timestamp);
+    }
+
+    /// @notice Finalize the committed merkle root after delay (step 2 of 2)
+    /// @dev Transitions to Refunding state. Anyone can call after delay to prevent admin lockout.
+    function finalizeRefundMerkleRoot() external inState(CampaignState.Frozen) {
+        if (pendingMerkleRoot == bytes32(0)) revert NoPendingMerkleRoot();
+        if (block.timestamp < merkleRootCommitTime + MERKLE_ROOT_DELAY) revert MerkleRootDelayNotElapsed();
+
+        campaign.refundMerkleRoot = pendingMerkleRoot;
         campaign.state = CampaignState.Refunding;
-        emit RefundMerkleRootSet(_merkleRoot, campaign.snapshotBlock);
+        emit RefundMerkleRootSet(pendingMerkleRoot, campaign.snapshotBlock);
+        pendingMerkleRoot = bytes32(0);
+    }
+
+    /// @notice Cancel a committed merkle root before finalization
+    /// @dev Allows admin to correct a wrong commitment without waiting for the delay
+    function cancelPendingMerkleRoot() external onlyAdmin inState(CampaignState.Frozen) {
+        if (pendingMerkleRoot == bytes32(0)) revert NoPendingMerkleRoot();
+        bytes32 cancelled = pendingMerkleRoot;
+        pendingMerkleRoot = bytes32(0);
+        merkleRootCommitTime = 0;
+        emit MerkleRootCancelled(cancelled);
     }
 
     /// @notice Initiate admin transfer (2-step process)
@@ -727,12 +1153,23 @@ contract VibesTranchEscrow is ReentrancyGuard {
     // ============ Refund Functions ============
 
     /// @notice Claim refund for failed raise (contributor refund)
+    /// @dev Audit fix F1: For pro-rata raises, subtracts any excess already claimed to prevent double-refund
     function claimContributorRefund() external nonReentrant inState(CampaignState.Failed) {
         Contribution storage contrib = contributions[msg.sender];
         if (contrib.amount == 0) revert NotAContributor();
         if (contrib.refundClaimed) revert AlreadyClaimed();
 
         uint256 refundAmount = contrib.amount;
+
+        // Audit fix F1: If pro-rata excess was already claimed, subtract it to prevent double-refund.
+        // Without this, a contributor who claimed excess before emergency rollback would extract
+        // more ETH than they contributed, causing insolvency for later claimants.
+        if (contrib.excessClaimed && campaign.raiseType == RaiseType.ProRata && campaign.totalCommitted > campaign.goal) {
+            uint256 allocation = (contrib.amount * campaign.goal) / campaign.totalCommitted;
+            uint256 excessAlreadyPaid = contrib.amount - allocation;
+            refundAmount = refundAmount - excessAlreadyPaid;
+        }
+
         contrib.refundClaimed = true;
 
         (bool success, ) = msg.sender.call{value: refundAmount}("");
@@ -751,8 +1188,8 @@ contract VibesTranchEscrow is ReentrancyGuard {
     {
         if (refundClaimedFromMerkle[msg.sender]) revert AlreadyClaimed();
 
-        // Verify merkle proof
-        bytes32 leaf = keccak256(abi.encodePacked(msg.sender, _tokenAmount));
+        // Verify merkle proof (double-hash to prevent leaf/node collision — audit fix C-02)
+        bytes32 leaf = keccak256(abi.encodePacked(keccak256(abi.encodePacked(msg.sender, _tokenAmount))));
         if (!MerkleProof.verify(_merkleProof, campaign.refundMerkleRoot, leaf)) {
             revert InvalidProof();
         }
@@ -774,7 +1211,16 @@ contract VibesTranchEscrow is ReentrancyGuard {
     }
 
     /// @notice Claim excess ETH for ProRata oversubscription
-    function claimExcessRefund() external nonReentrant inState(CampaignState.Funded) {
+    /// @dev Audit fix F4: Also allowed in Frozen/Refunding state so excess refunds
+    ///      aren't absorbed into the holder refund pool
+    function claimExcessRefund() external nonReentrant {
+        CampaignState state = campaign.state;
+        if (state != CampaignState.Funded &&
+            state != CampaignState.Completed &&
+            state != CampaignState.Frozen &&
+            state != CampaignState.Refunding) {
+            revert InvalidState(state, CampaignState.Funded);
+        }
         if (campaign.raiseType != RaiseType.ProRata) revert NoExcessToRefund();
 
         Contribution storage contrib = contributions[msg.sender];
@@ -794,7 +1240,11 @@ contract VibesTranchEscrow is ReentrancyGuard {
         if (excess == 0) revert NoExcessToRefund();
 
         contrib.excessClaimed = true;
-        totalExcessClaimed += excess;
+
+        // Audit fix F4: Decrement excess liability so freeze accounting stays accurate
+        // Audit fix C-01: Use min() to prevent underflow from per-user rounding gaps
+        uint256 liabilityDeduction = excess > totalExcessRefundLiability ? totalExcessRefundLiability : excess;
+        totalExcessRefundLiability -= liabilityDeduction;
 
         (bool success, ) = msg.sender.call{value: excess}("");
         require(success, "Excess refund failed");
@@ -866,7 +1316,7 @@ contract VibesTranchEscrow is ReentrancyGuard {
 
     // ============ Founder Updates ============
 
-    /// @notice Post an on-chain update (emits event with IPFS CID)
+    /// @notice Post an onchain update (emits event with IPFS CID)
     /// @param ipfsCid IPFS CID pointing to update JSON { title, body, links }
     function postUpdate(string calldata ipfsCid) external {
         if (msg.sender != campaign.founder) revert OnlyFounder();
@@ -878,9 +1328,8 @@ contract VibesTranchEscrow is ReentrancyGuard {
 
     // ============ Receive ============
 
-    /// @notice Accept direct ETH transfers as contributions
-    /// @dev Uses _contribute() for single source of truth, with nonReentrant for safety
-    receive() external payable nonReentrant {
-        _contribute(msg.sender, msg.value);
+    /// @notice Reject direct ETH transfers — use contribute() with signature instead
+    receive() external payable {
+        revert UseContributeFunction();
     }
 }

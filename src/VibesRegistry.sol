@@ -32,12 +32,27 @@ contract VibesRegistry {
     // EVENTS
     // ============================================
     
+    /**
+     * @notice Emitted when a token's provenance is registered
+     * @param token Address of the registered token
+     * @param founder Address of the founding developer
+     * @param capsuleHash Keccak256 hash of the off-chain capsule JSON
+     */
     event VibesRegistered(
         address indexed token,
         address indexed founder,
         bytes32 capsuleHash
     );
-    
+
+    /**
+     * @notice Emitted when an AI agent attestation is recorded for a token
+     * @param token Address of the attested token
+     * @param founder Address of the founding developer
+     * @param agentTool Tool used (0=Other, 1=ClaudeCode, 2=Cursor, 3=Windsurf, 4=Replit)
+     * @param modelProvider AI provider (0=Other, 1=Anthropic, 2=OpenAI, 3=Google, 4=Local)
+     * @param proofType Type of proof (0=Other, 1=Transcript, 2=PRD, 3=RepoCommit, 4=CodeZip)
+     * @param artifactHash Keccak256 hash of the proof artifact
+     */
     event AgentAttested(
         address indexed token,
         address indexed founder,
@@ -46,8 +61,13 @@ contract VibesRegistry {
         uint8 proofType,
         bytes32 artifactHash
     );
-    
+
+    /// @notice Emitted when a router is authorized to register tokens
+    /// @param router Address of the authorized router
     event RouterAuthorized(address indexed router);
+
+    /// @notice Emitted when a router's authorization is revoked
+    /// @param router Address of the revoked router
     event RouterRevoked(address indexed router);
 
     // ============================================
@@ -56,7 +76,10 @@ contract VibesRegistry {
     
     /// @notice Contract owner
     address public owner;
-    
+
+    /// @notice Pending owner for two-step ownership transfer
+    address public pendingOwner;
+
     /// @notice Authorized routers that can register on behalf of founders
     mapping(address => bool) public authorizedRouters;
     
@@ -76,6 +99,7 @@ contract VibesRegistry {
     // CONSTRUCTOR
     // ============================================
     
+    /// @notice Deploy the registry with the deployer as owner
     constructor() {
         owner = msg.sender;
     }
@@ -84,6 +108,7 @@ contract VibesRegistry {
     // MODIFIERS
     // ============================================
     
+    /// @dev Restricts access to the contract owner
     modifier onlyOwner() {
         require(msg.sender == owner, "Not owner");
         _;
@@ -113,12 +138,24 @@ contract VibesRegistry {
     }
     
     /**
-     * @notice Transfer ownership
-     * @param newOwner New owner address
+     * @notice Propose a new owner (two-step transfer, step 1)
+     * @dev The new owner must call acceptOwnership() to complete the transfer.
+     *      This prevents accidental ownership loss from typos or wrong addresses.
+     * @param newOwner Address of the proposed new owner
      */
     function transferOwnership(address newOwner) external onlyOwner {
         require(newOwner != address(0), "Invalid owner");
-        owner = newOwner;
+        pendingOwner = newOwner;
+    }
+
+    /**
+     * @notice Accept ownership transfer (two-step transfer, step 2)
+     * @dev Only the pending owner can call this to complete the transfer.
+     */
+    function acceptOwnership() external {
+        require(msg.sender == pendingOwner, "Not pending owner");
+        owner = pendingOwner;
+        pendingOwner = address(0);
     }
 
     // ============================================
@@ -159,7 +196,13 @@ contract VibesRegistry {
     }
     
     /**
-     * @notice Internal registration logic
+     * @notice Internal registration logic shared by register() and registerFromRouter()
+     * @dev Validates inputs, stores provenance data, and emits registration events.
+     *      Once registered, a token's provenance cannot be changed.
+     * @param token Address of the token to register
+     * @param founder Address of the founding developer
+     * @param capsuleHash Keccak256 hash of the off-chain capsule JSON
+     * @param attestation AI agent attestation data
      */
     function _register(
         address token,

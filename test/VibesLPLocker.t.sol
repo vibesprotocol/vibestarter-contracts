@@ -3,11 +3,13 @@ pragma solidity ^0.8.20;
 
 import "forge-std/Test.sol";
 import "../src/VibesLPLocker.sol";
+import "../src/VibesLPFeeClaimer.sol";
 import "../src/VibesToken.sol";
 import "./mocks/MockAerodromeRouter.sol";
 
 contract VibesLPLockerTest is Test {
     VibesLPLocker public locker;
+    VibesLPFeeClaimer public claimerImpl;
     MockAerodromeRouter public router;
     VibesToken public token;
 
@@ -16,10 +18,11 @@ contract VibesLPLockerTest is Test {
     address public campaign2 = address(0x3);
     address public weth = address(0x4444);
     address public factory = address(0x5555);
+    address public platformRecipient = address(0x7777);
 
     uint256 public constant TOKEN_SUPPLY = 1_000_000 ether;
-    uint256 public constant LP_TOKENS = 200_000 ether; // 20% of supply
-    uint256 public constant LP_ETH = 10 ether; // 20% of 50 ETH raised
+    uint256 public constant LP_TOKENS = 150_000 ether; // 15% of supply
+    uint256 public constant LP_ETH = 7.5 ether; // 15% of 50 ETH raised
 
     function setUp() public {
         // Deploy mock router
@@ -28,7 +31,11 @@ contract VibesLPLockerTest is Test {
         // Deploy locker
         locker = new VibesLPLocker(address(router), factory);
 
-        // Set this test contract as authorized router
+        // Register the VibesLPFeeClaimer implementation for EIP-1167 cloning
+        claimerImpl = new VibesLPFeeClaimer();
+        locker.setFeeClaimerImplementation(address(claimerImpl));
+
+        // Authorize test contract as the router so it can call createAndLockLP
         locker.setAuthorizedRouter(address(this));
 
         // Deploy test token
@@ -67,16 +74,20 @@ contract VibesLPLockerTest is Test {
         (address pool, uint256 lpAmount) = locker.createAndLockLP{value: LP_ETH}(
             address(token),
             LP_TOKENS,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
 
         // Verify LP was created
         assertTrue(pool != address(0), "Pool should be created");
         assertTrue(lpAmount > 0, "LP amount should be positive");
 
-        // Verify LP is locked (sent to dead address)
-        uint256 deadBalance = IERC20(pool).balanceOf(locker.DEAD_ADDRESS());
-        assertEq(deadBalance, lpAmount, "LP tokens should be at dead address");
+        // Verify LP is soulbound to the per-campaign fee claimer (replaces the 0xdead sink)
+        address claimer = locker.campaignToFeeClaimer(campaign);
+        assertTrue(claimer != address(0), "Claimer should be deployed");
+        uint256 claimerBalance = IERC20(pool).balanceOf(claimer);
+        assertEq(claimerBalance, lpAmount, "LP tokens should be at claimer");
 
         // Verify locker has no LP tokens
         uint256 lockerBalance = IERC20(pool).balanceOf(address(locker));
@@ -92,7 +103,9 @@ contract VibesLPLockerTest is Test {
         (address pool, uint256 lpAmount) = locker.createAndLockLP{value: LP_ETH}(
             address(token),
             LP_TOKENS,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
 
         // Check position details
@@ -132,7 +145,9 @@ contract VibesLPLockerTest is Test {
         locker.createAndLockLP{value: LP_ETH}(
             address(token),
             LP_TOKENS,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
     }
 
@@ -141,7 +156,9 @@ contract VibesLPLockerTest is Test {
         locker.createAndLockLP{value: LP_ETH}(
             address(0),
             LP_TOKENS,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
     }
 
@@ -152,7 +169,9 @@ contract VibesLPLockerTest is Test {
         locker.createAndLockLP{value: LP_ETH}(
             address(token),
             0,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
     }
 
@@ -163,7 +182,9 @@ contract VibesLPLockerTest is Test {
         locker.createAndLockLP{value: 0}(
             address(token),
             LP_TOKENS,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
     }
 
@@ -174,7 +195,9 @@ contract VibesLPLockerTest is Test {
         locker.createAndLockLP{value: LP_ETH}(
             address(token),
             LP_TOKENS,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
 
         // Second lock for same campaign should fail
@@ -182,7 +205,9 @@ contract VibesLPLockerTest is Test {
         locker.createAndLockLP{value: LP_ETH}(
             address(token),
             LP_TOKENS,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
     }
 
@@ -197,14 +222,18 @@ contract VibesLPLockerTest is Test {
         locker.createAndLockLP{value: LP_ETH}(
             address(token),
             LP_TOKENS,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
 
         // Lock for second campaign should work
         locker.createAndLockLP{value: LP_ETH}(
             address(token),
             LP_TOKENS,
-            campaign2
+            campaign2,
+            platformRecipient,
+            address(0)
         );
 
         // Verify both are locked
@@ -213,18 +242,24 @@ contract VibesLPLockerTest is Test {
         assertEq(locker.totalLockedPositions(), 2);
     }
 
-    function test_createAndLockLP_revertsWhenRouterFails() public {
+    function test_createAndLockLP_rescuesWhenRouterFails() public {
         token.approve(address(locker), LP_TOKENS);
 
-        // Make router fail
+        // Make router fail — now rescues instead of reverting (MEV protection)
         router.setShouldFail(true);
 
-        vm.expectRevert("Mock: LP creation failed");
-        locker.createAndLockLP{value: LP_ETH}(
+        (address pool, uint256 lpAmount) = locker.createAndLockLP{value: LP_ETH}(
             address(token),
             LP_TOKENS,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
+
+        // Rescued, not reverted
+        assertEq(pool, address(0));
+        assertEq(lpAmount, 0);
+        assertTrue(locker.hasRescuedFunds(campaign));
     }
 
     // ============ View Function Tests ============
@@ -236,7 +271,9 @@ contract VibesLPLockerTest is Test {
         locker.createAndLockLP{value: LP_ETH}(
             address(token),
             LP_TOKENS,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
 
         assertEq(locker.totalLockedPositions(), 1);
@@ -258,12 +295,16 @@ contract VibesLPLockerTest is Test {
         locker.createAndLockLP{value: LP_ETH}(
             address(token),
             LP_TOKENS,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
         locker.createAndLockLP{value: LP_ETH}(
             address(token),
             LP_TOKENS,
-            campaign2
+            campaign2,
+            platformRecipient,
+            address(0)
         );
 
         VibesLPLocker.LockedLP[] memory positions = locker.getAllLockedPositions();
@@ -283,7 +324,9 @@ contract VibesLPLockerTest is Test {
         (address pool, uint256 lpAmount) = locker.createAndLockLP{value: LP_ETH}(
             address(token),
             LP_TOKENS,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
 
         (bool locked, uint256 balance) = locker.verifyLPLocked(campaign);
@@ -296,7 +339,9 @@ contract VibesLPLockerTest is Test {
         locker.createAndLockLP{value: LP_ETH}(
             address(token),
             LP_TOKENS,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
 
         uint256 price = locker.getInitialPrice(campaign);
@@ -324,7 +369,9 @@ contract VibesLPLockerTest is Test {
         (address pool, uint256 lpAmount) = locker.createAndLockLP{value: smallETH}(
             address(token),
             smallTokens,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
 
         assertTrue(lpAmount > 0);
@@ -345,7 +392,9 @@ contract VibesLPLockerTest is Test {
         (address pool, uint256 lpAmount) = locker.createAndLockLP{value: largeETH}(
             address(token),
             largeTokens,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
 
         assertTrue(lpAmount > 0);
@@ -356,41 +405,33 @@ contract VibesLPLockerTest is Test {
 
     function test_fullFlow_matchesRaisePrice() public {
         // Scenario: 50 ETH raised, 1M token supply
-        // 20% tokens (200k) + 20% ETH (10 ETH) goes to LP
-        // Price should be: 10 ETH / 200k tokens = 0.00005 ETH/token
-
-        // If backer contributed 1 ETH at fixed goal, they get:
-        // (1 ETH / 50 ETH total) * 720,000 backer tokens = 14,400 tokens
-        // Implied price: 1 ETH / 14,400 tokens = 0.0000694 ETH/token
-
-        // Wait, let me recalculate for the 72/18/10 split:
-        // Total supply: 1,000,000
-        // Backers: 72% = 720,000 tokens
-        // LP: 18% = 180,000 tokens
-        // Founder: 10% = 100,000 tokens (vested)
+        // 15% tokens (150k) + 15% ETH (7.5 ETH) goes to LP
+        // Price should be: 7.5 ETH / 150k tokens = 0.00005 ETH/token
         //
-        // If 50 ETH raised and 20% (10 ETH) goes to LP:
-        // LP price = 10 ETH / 180,000 tokens = 0.0000556 ETH/token
+        // With 5% founder, 0% treasury:
+        // Total supply: 1,000,000
+        // Backers: 77.5% = 775,000 tokens
+        // LP: 15% = 150,000 tokens
+        // Founder: 5% = 50,000 tokens (vested)
+        // Ecosystem: 2.5% = 25,000 tokens (stakers)
+        //
+        // If 50 ETH raised and 15% (7.5 ETH) goes to LP:
+        // LP price = 7.5 ETH / 150,000 tokens = 0.00005 ETH/token
         //
         // Backer who contributed 1 ETH gets:
-        // (1/50) * 720,000 = 14,400 tokens
-        // Effective backer price: 1 ETH / 14,400 = 0.0000694 ETH/token
+        // (1/50) * 775,000 = 15,500 tokens
+        // Effective backer price: 1 ETH / 15,500 = 0.0000645 ETH/token
         //
-        // LP price is LOWER than backer price - this is correct for 72/18/10 split
-
-        // For 80/20 backer/LP split (no founder):
-        // Backers: 80% = 800,000 tokens
-        // LP: 20% = 200,000 tokens
-        // LP price = 10 ETH / 200,000 = 0.00005 ETH/token
-        // Backer price: 1 ETH / 16,000 = 0.0000625 ETH/token
-        // LP price is still lower - this is expected since LP gets same ETH % but more tokens %
+        // LP price is LOWER than backer price - backers get a discount
 
         token.approve(address(locker), LP_TOKENS);
 
         locker.createAndLockLP{value: LP_ETH}(
             address(token),
             LP_TOKENS,
-            campaign
+            campaign,
+            platformRecipient,
+            address(0)
         );
 
         uint256 lpPrice = locker.getInitialPrice(campaign);
@@ -407,6 +448,162 @@ contract VibesLPLockerTest is Test {
     function test_canReceiveETH() public {
         (bool success, ) = address(locker).call{value: 1 ether}("");
         assertTrue(success);
+    }
+
+    // ============ Rescue Tests (MEV front-running protection) ============
+
+    function test_createAndLockLP_rescuesOnFailure() public {
+        token.approve(address(locker), LP_TOKENS);
+
+        // Make router fail (simulates pool pre-seeded with skewed ratio)
+        router.setShouldFail(true);
+
+        // Should NOT revert — funds are rescued instead
+        (address pool, uint256 lpAmount) = locker.createAndLockLP{value: LP_ETH}(
+            address(token),
+            LP_TOKENS,
+            campaign,
+            platformRecipient,
+            address(0)
+        );
+
+        // Returns zero pool/lpAmount
+        assertEq(pool, address(0));
+        assertEq(lpAmount, 0);
+
+        // Audit fix F7: Campaign is marked as rescued (NOT locked) to prevent view function corruption
+        assertFalse(locker.hasLockedLP(campaign)); // No real locked position exists
+        assertTrue(locker.hasRescuedLP(campaign));  // Rescued flag is set instead
+
+        // Rescue funds are stored
+        assertTrue(locker.hasRescuedFunds(campaign));
+        VibesLPLocker.RescueFunds memory rescue = locker.getRescuedFunds(campaign);
+        assertEq(rescue.token, address(token));
+        assertEq(rescue.tokenAmount, LP_TOKENS);
+        assertEq(rescue.ethAmount, LP_ETH);
+        assertEq(rescue.campaign, campaign);
+        assertFalse(rescue.resolved);
+    }
+
+    function test_resolveRescuedFunds_success() public {
+        token.approve(address(locker), LP_TOKENS);
+        router.setShouldFail(true);
+
+        locker.createAndLockLP{value: LP_ETH}(
+            address(token),
+            LP_TOKENS,
+            campaign,
+            platformRecipient,
+            address(0)
+        );
+
+        address recipient = address(0x9999);
+        uint256 recipientBalBefore = recipient.balance;
+        uint256 recipientTokensBefore = token.balanceOf(recipient);
+
+        // Owner resolves
+        locker.resolveRescuedFunds(campaign, recipient);
+
+        // Recipient receives rescued funds
+        assertEq(recipient.balance - recipientBalBefore, LP_ETH);
+        assertEq(token.balanceOf(recipient) - recipientTokensBefore, LP_TOKENS);
+
+        // Marked as resolved
+        VibesLPLocker.RescueFunds memory rescue = locker.getRescuedFunds(campaign);
+        assertTrue(rescue.resolved);
+    }
+
+    function test_resolveRescuedFunds_revertsIfNoRescue() public {
+        vm.expectRevert(VibesLPLocker.NoRescuedFunds.selector);
+        locker.resolveRescuedFunds(campaign, address(0x9999));
+    }
+
+    function test_resolveRescuedFunds_revertsIfAlreadyResolved() public {
+        token.approve(address(locker), LP_TOKENS);
+        router.setShouldFail(true);
+
+        locker.createAndLockLP{value: LP_ETH}(
+            address(token),
+            LP_TOKENS,
+            campaign,
+            platformRecipient,
+            address(0)
+        );
+
+        locker.resolveRescuedFunds(campaign, address(0x9999));
+
+        vm.expectRevert(VibesLPLocker.AlreadyResolved.selector);
+        locker.resolveRescuedFunds(campaign, address(0x9999));
+    }
+
+    function test_resolveRescuedFunds_onlyOwner() public {
+        token.approve(address(locker), LP_TOKENS);
+        router.setShouldFail(true);
+
+        locker.createAndLockLP{value: LP_ETH}(
+            address(token),
+            LP_TOKENS,
+            campaign,
+            platformRecipient,
+            address(0)
+        );
+
+        vm.prank(founder);
+        vm.expectRevert(VibesLPLocker.OnlyOwner.selector);
+        locker.resolveRescuedFunds(campaign, founder);
+    }
+
+    // ============ Audit Fix F7: Rescue tracking tests ============
+
+    /// @notice Audit fix F7a: After rescue, getLockedPosition should NOT return wrong campaign data
+    function test_F7_GetLockedPosition_AfterRescue_DoesNotReturnWrongCampaign() public {
+        // First, create a real locked LP for campaign1
+        token.approve(address(locker), LP_TOKENS);
+        (address pool1, uint256 lpAmount1) = locker.createAndLockLP{value: LP_ETH}(
+            address(token),
+            LP_TOKENS,
+            campaign,
+            platformRecipient,
+            address(0)
+        );
+        assertTrue(pool1 != address(0));
+        assertTrue(lpAmount1 > 0);
+
+        // Now force a rescue for campaign2
+        VibesToken token2 = new VibesToken("Test2", "T2", 18, TOKEN_SUPPLY, address(this));
+        token2.approve(address(locker), LP_TOKENS);
+        router.setShouldFail(true);
+        locker.createAndLockLP{value: LP_ETH}(address(token2), LP_TOKENS, campaign2, platformRecipient, address(0));
+        router.setShouldFail(false);
+
+        // campaign2 should be rescued, not locked
+        assertTrue(locker.hasRescuedLP(campaign2), "Campaign2 should be rescued");
+        assertFalse(locker.hasLockedLP(campaign2), "Campaign2 should NOT be marked as locked");
+
+        // getLockedPosition for campaign2 should revert, NOT return campaign1's data
+        vm.expectRevert("No locked LP for campaign");
+        locker.getLockedPosition(campaign2);
+
+        // verifyLPLocked for campaign2 should return false
+        (bool locked, ) = locker.verifyLPLocked(campaign2);
+        assertFalse(locked, "Rescued campaign should not verify as locked");
+
+        // campaign1 should still work correctly
+        VibesLPLocker.LockedLP memory pos = locker.getLockedPosition(campaign);
+        assertEq(pos.campaign, campaign, "Campaign1 position should be correct");
+    }
+
+    /// @notice Audit fix F7a: verifyLPLocked returns false for rescued campaigns
+    function test_F7_VerifyLPLocked_ReturnsFalse_ForRescuedCampaign() public {
+        token.approve(address(locker), LP_TOKENS);
+        router.setShouldFail(true);
+        locker.createAndLockLP{value: LP_ETH}(address(token), LP_TOKENS, campaign, platformRecipient, address(0));
+        router.setShouldFail(false);
+
+        assertTrue(locker.hasRescuedLP(campaign));
+        (bool locked, uint256 balance) = locker.verifyLPLocked(campaign);
+        assertFalse(locked, "Should not report as locked");
+        assertEq(balance, 0, "Balance should be 0");
     }
 
     // Allow test contract to receive ETH refunds

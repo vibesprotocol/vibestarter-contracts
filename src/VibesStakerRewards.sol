@@ -1,20 +1,24 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * @title VibesStakerRewards
- * @notice Manages reward distributions for $VIBES stakers from platform raises
- * @dev For each raise that finalizes successfully, 2% of the vibetoken is allocated to stakers.
- *      A Merkle root is set per raise (off-chain snapshot at finalization time).
- *      Stakers can claim their proportional share using Merkle proofs.
- *      No expiry - rewards remain claimable forever.
+ * @notice Accumulator-based reward distribution for $VIBES stakers from platform raises
+ * @dev For each raise that finalizes successfully, 2.5% of the vibetoken is allocated to stakers.
+ *      Uses a Synthetix-style reward-per-token accumulator — fully atomic, no admin action needed.
  *
- *      Merkle leaf structure: keccak256(abi.encodePacked(staker, tokenAmount))
+ *      Flow:
+ *      1. Router calls safeTransfer(tokens) to this contract during completeFinalization()
+ *      2. Router calls notifyReward(token, amount, escrow) atomically in the same tx
+ *      3. Contract snapshots rewardPerToken for that raise using current staking state
+ *      4. Stakers claim proportional share whenever they want — no Merkle, no admin
+ *
+ *      Key invariant: A staker's share of raise R = (stakedBalance at time of R) / totalStaked at time of R
+ *      This is captured atomically via the accumulator snapshot at notifyReward() time.
  */
 contract VibesStakerRewards is ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -23,23 +27,15 @@ contract VibesStakerRewards is ReentrancyGuard {
     // EVENTS
     // ============================================
 
-    /// @notice Emitted when a rewards root is set for a raise
-    /// @param escrow The escrow contract address (unique identifier for the raise)
-    /// @param token The vibetoken being distributed
-    /// @param merkleRoot Root of the Merkle tree
-    /// @param totalTokens Total tokens allocated to stakers (2% of supply)
-    event RewardsRootSet(
+    /// @notice Emitted when rewards are registered for a raise (called atomically by router)
+    event RewardNotified(
         address indexed escrow,
         address indexed token,
-        bytes32 merkleRoot,
-        uint256 totalTokens
+        uint256 totalTokens,
+        uint256 totalStakedAtSnapshot
     );
 
     /// @notice Emitted when a staker claims rewards for a raise
-    /// @param staker Address of the claimant
-    /// @param escrow The escrow contract address
-    /// @param token The vibetoken claimed
-    /// @param amount Amount of tokens claimed
     event RewardClaimed(
         address indexed staker,
         address indexed escrow,
@@ -52,52 +48,66 @@ contract VibesStakerRewards is ReentrancyGuard {
     // ============================================
 
     /// @notice Reward data for a single raise
-    struct RaiseRewards {
-        address token;          // The vibetoken address
-        bytes32 merkleRoot;     // Merkle root for claims
-        uint256 totalTokens;    // Total tokens allocated (2%)
-        uint256 claimedTokens;  // Tokens claimed so far
-        bool rootSet;           // Whether the root has been set
-    }
-
-    /// @notice Data for batch claiming
-    struct ClaimData {
-        address escrow;         // Escrow address identifying the raise
-        uint256 amount;         // Token amount to claim
-        bytes32[] proof;        // Merkle proof
+    struct RaiseReward {
+        address token;              // The vibetoken address
+        uint256 totalTokens;        // Total tokens allocated (2.5% of supply)
+        uint256 claimedTokens;      // Tokens claimed so far
+        uint256 totalStakedSnapshot; // Total staked at notification time
+        uint256 notifiedAt;         // block.timestamp when notifyReward was called
+        bool active;                // Whether reward has been registered
     }
 
     // ============================================
     // STATE
     // ============================================
 
-    /// @notice Admin address (can set merkle roots)
+    /// @notice The VibesStaking contract (read staker balances from here)
+    address public immutable stakingContract;
+
+    /// @notice Authorized router that can call notifyReward
+    address public authorizedRouter;
+
+    /// @notice Admin address (can update router, two-step transfer)
     address public admin;
 
     /// @notice Pending admin for two-step transfer
     address public pendingAdmin;
 
-    /// @notice Rewards data per raise (escrow address => rewards)
-    mapping(address => RaiseRewards) public raiseRewards;
+    /// @notice Rewards data per raise (escrow address => reward)
+    mapping(address => RaiseReward) public raiseRewards;
 
     /// @notice Track claimed status per raise per staker (escrow => staker => claimed)
     mapping(address => mapping(address => bool)) public hasClaimed;
 
+    /// @notice Staker's staked balance snapshot at each raise (escrow => staker => balance)
+    /// @dev Populated lazily from staking contract at claim time if not already set
+    mapping(address => mapping(address => uint256)) public stakerSnapshot;
+
+    /// @notice Whether a staker's snapshot has been taken for a raise
+    mapping(address => mapping(address => bool)) public snapshotTaken;
+
     /// @notice List of all escrows with rewards (for enumeration)
     address[] public rewardedEscrows;
+
+    /// @notice Audit fix F4: Snapshot ID from VibesStaking for each raise
+    /// @dev Taken atomically during notifyReward() to capture staker balances at notification time
+    mapping(address => uint256) public raiseSnapshotId;
 
     // ============================================
     // ERRORS
     // ============================================
 
     error OnlyAdmin();
+    error OnlyRouter();
     error ZeroAddress();
-    error RootAlreadySet();
-    error RootNotSet();
+    error RewardAlreadySet();
+    error RewardNotActive();
     error AlreadyClaimed();
-    error InvalidProof();
-    error InvalidAmount();
+    error NothingToClaim();
     error NoRewardsToClaim();
+    error NoStakeAtSnapshot();
+    // Audit fix L-3
+    error NoSnapshotForRaise();
 
     // ============================================
     // MODIFIERS
@@ -108,15 +118,186 @@ contract VibesStakerRewards is ReentrancyGuard {
         _;
     }
 
+    modifier onlyRouter() {
+        if (msg.sender != authorizedRouter) revert OnlyRouter();
+        _;
+    }
+
     // ============================================
     // CONSTRUCTOR
     // ============================================
 
     /// @notice Initialize the rewards contract
-    /// @param _admin Admin address that can set merkle roots
-    constructor(address _admin) {
+    /// @param _admin Admin address
+    /// @param _stakingContract VibesStaking contract to read balances from
+    /// @param _authorizedRouter Router that can call notifyReward
+    constructor(address _admin, address _stakingContract, address _authorizedRouter) {
         if (_admin == address(0)) revert ZeroAddress();
+        if (_stakingContract == address(0)) revert ZeroAddress();
+        if (_authorizedRouter == address(0)) revert ZeroAddress();
         admin = _admin;
+        stakingContract = _stakingContract;
+        authorizedRouter = _authorizedRouter;
+    }
+
+    // ============================================
+    // ROUTER FUNCTION (called atomically during finalization)
+    // ============================================
+
+    /**
+     * @notice Register a reward for a raise — called by router during completeFinalization()
+     * @dev Tokens MUST be transferred to this contract BEFORE this call.
+     *      Snapshots the current totalStaked from the staking contract.
+     *      If totalStaked == 0, tokens remain in the contract for future admin recovery.
+     * @param token Vibetoken address
+     * @param amount Amount of tokens allocated
+     * @param escrow Escrow address (unique identifier for the raise)
+     */
+    function notifyReward(address token, uint256 amount, address escrow) external onlyRouter {
+        if (token == address(0)) revert ZeroAddress();
+        if (escrow == address(0)) revert ZeroAddress();
+        if (raiseRewards[escrow].active) revert RewardAlreadySet();
+
+        // Audit fix F4: Take a snapshot of staker balances atomically with reward notification.
+        // This captures the exact staking state at notification time, preventing stakers from
+        // increasing their balance post-notification to claim a larger share.
+        uint256 snapId = IVibesStakingSnapshot(stakingContract).takeSnapshot();
+        raiseSnapshotId[escrow] = snapId;
+
+        // Read total staked from the snapshot (same value, but now immutably recorded)
+        uint256 currentTotalStaked = IVibesStakingSnapshot(stakingContract).totalStakedAtSnapshot(snapId);
+
+        raiseRewards[escrow] = RaiseReward({
+            token: token,
+            totalTokens: amount,
+            claimedTokens: 0,
+            totalStakedSnapshot: currentTotalStaked,
+            notifiedAt: block.timestamp,
+            active: true
+        });
+
+        rewardedEscrows.push(escrow);
+
+        emit RewardNotified(escrow, token, amount, currentTotalStaked);
+    }
+
+    // ============================================
+    // CLAIM FUNCTIONS
+    // ============================================
+
+    /**
+     * @notice Claim staker rewards for a single raise
+     * @param escrow Escrow address identifying the raise
+     */
+    function claim(address escrow) external nonReentrant {
+        _claimInternal(escrow, msg.sender);
+    }
+
+    /**
+     * @notice Batch claim rewards across multiple raises
+     * @param escrows Array of escrow addresses to claim from
+     */
+    function claimMultiple(address[] calldata escrows) external nonReentrant {
+        if (escrows.length == 0) revert NoRewardsToClaim();
+        require(escrows.length <= 100, "Batch too large");
+
+        for (uint256 i = 0; i < escrows.length; i++) {
+            // Skip if already claimed or not active (don't revert, just continue)
+            if (hasClaimed[escrows[i]][msg.sender]) continue;
+            if (!raiseRewards[escrows[i]].active) continue;
+
+            // Skip if staker had no stake (avoid revert in batch)
+            uint256 stakerBal = _getStakerBalance(escrows[i], msg.sender);
+            if (stakerBal == 0) continue;
+
+            _claimInternalUnchecked(escrows[i], msg.sender, stakerBal);
+        }
+    }
+
+    /**
+     * @notice Internal claim logic with full validation
+     */
+    function _claimInternal(address escrow, address staker) internal {
+        RaiseReward storage reward = raiseRewards[escrow];
+
+        if (!reward.active) revert RewardNotActive();
+        if (hasClaimed[escrow][staker]) revert AlreadyClaimed();
+
+        uint256 stakerBal = _getStakerBalance(escrow, staker);
+        if (stakerBal == 0) revert NoStakeAtSnapshot();
+
+        _claimInternalUnchecked(escrow, staker, stakerBal);
+    }
+
+    /**
+     * @notice Internal claim without validation (for batch use after pre-checks)
+     */
+    function _claimInternalUnchecked(address escrow, address staker, uint256 stakerBal) internal {
+        RaiseReward storage reward = raiseRewards[escrow];
+
+        // Guard against division by zero (no stakers when reward was notified)
+        if (reward.totalStakedSnapshot == 0) return;
+
+        // Calculate proportional share: (stakerBalance / totalStaked) * totalTokens
+        uint256 amount = (stakerBal * reward.totalTokens) / reward.totalStakedSnapshot;
+
+        if (amount == 0) return; // Rounding to zero for tiny stakes
+
+        // Cap to remaining balance (handles rounding dust on last claimer)
+        uint256 remaining = IERC20(reward.token).balanceOf(address(this));
+        if (amount > remaining) {
+            amount = remaining;
+        }
+
+        if (amount == 0) return;
+
+        // Mark as claimed and transfer
+        hasClaimed[escrow][staker] = true;
+        reward.claimedTokens += amount;
+
+        IERC20(reward.token).safeTransfer(staker, amount);
+
+        emit RewardClaimed(staker, escrow, reward.token, amount);
+    }
+
+    /**
+     * @notice Get the staker's balance for a raise using snapshot data
+     * @dev Audit fix F4: Uses snapshot-based balance instead of current balance to prevent
+     *      stakers from increasing their stake post-notification and claiming a larger share.
+     *      On first call for a (escrow, staker) pair, reads from staking snapshot and caches.
+     *      Eligibility check: staker's firstStakeTime must be strictly before the raise's
+     *      notifiedAt timestamp.
+     */
+    function _getStakerBalance(address escrow, address staker) internal returns (uint256) {
+        if (snapshotTaken[escrow][staker]) {
+            return stakerSnapshot[escrow][staker];
+        }
+
+        // Check eligibility: staker must have been staking before this raise was notified
+        uint256 stakerFirstStake = IVibesStakingReadOnly(stakingContract).firstStakeTime(staker);
+        uint256 notifiedAt = raiseRewards[escrow].notifiedAt;
+        if (stakerFirstStake == 0 || stakerFirstStake >= notifiedAt) {
+            // Not staking, or started staking at/after notification — ineligible
+            stakerSnapshot[escrow][staker] = 0;
+            snapshotTaken[escrow][staker] = true;
+            return 0;
+        }
+
+        // Audit fix F4: Read balance from snapshot (notification-time balance), not current balance.
+        // This prevents gaming where a staker increases their position after notification.
+        // Audit fix L-3: The previous `snapId == 0` backwards-compatibility fallback read the
+        // current stakedBalance, which silently re-introduced the F4 late-stake gaming vector.
+        // Any raise reaching this code path MUST have a snapshot, since notifyReward() always
+        // invokes takeSnapshot() and stores a non-zero id. Fail closed if somehow it doesn't.
+        uint256 snapId = raiseSnapshotId[escrow];
+        if (snapId == 0) revert NoSnapshotForRaise();
+        uint256 balance = IVibesStakingSnapshot(stakingContract).balanceAtSnapshot(snapId, staker);
+
+        // Cache it
+        stakerSnapshot[escrow][staker] = balance;
+        snapshotTaken[escrow][staker] = true;
+
+        return balance;
     }
 
     // ============================================
@@ -124,36 +305,12 @@ contract VibesStakerRewards is ReentrancyGuard {
     // ============================================
 
     /**
-     * @notice Set the Merkle root for a raise's staker rewards
-     * @dev Called by backend after raise finalization and snapshot generation.
-     *      Tokens must be transferred to this contract before or after this call.
-     * @param escrow Escrow contract address (unique identifier for the raise)
-     * @param token Vibetoken address
-     * @param merkleRoot Merkle root of (staker, amount) leaves
-     * @param totalTokens Total tokens allocated to stakers
+     * @notice Update the authorized router address
+     * @param _router New authorized router address
      */
-    function setRewardsRoot(
-        address escrow,
-        address token,
-        bytes32 merkleRoot,
-        uint256 totalTokens
-    ) external onlyAdmin {
-        if (escrow == address(0)) revert ZeroAddress();
-        if (token == address(0)) revert ZeroAddress();
-        if (merkleRoot == bytes32(0)) revert ZeroAddress();
-        if (raiseRewards[escrow].rootSet) revert RootAlreadySet();
-
-        raiseRewards[escrow] = RaiseRewards({
-            token: token,
-            merkleRoot: merkleRoot,
-            totalTokens: totalTokens,
-            claimedTokens: 0,
-            rootSet: true
-        });
-
-        rewardedEscrows.push(escrow);
-
-        emit RewardsRootSet(escrow, token, merkleRoot, totalTokens);
+    function setAuthorizedRouter(address _router) external onlyAdmin {
+        if (_router == address(0)) revert ZeroAddress();
+        authorizedRouter = _router;
     }
 
     /**
@@ -174,78 +331,23 @@ contract VibesStakerRewards is ReentrancyGuard {
         pendingAdmin = address(0);
     }
 
-    // ============================================
-    // CLAIM FUNCTIONS
-    // ============================================
-
     /**
-     * @notice Claim staker rewards for a single raise
-     * @param escrow Escrow address identifying the raise
-     * @param amount Amount of tokens allocated to caller
-     * @param proof Merkle proof
+     * @notice Rescue tokens from raises where totalStaked was 0 (no stakers to claim)
+     * @dev Only callable by admin. Only allows rescue from raises with zero stakers.
+     * @param escrow Escrow address
+     * @param to Recipient address
      */
-    function claim(
-        address escrow,
-        uint256 amount,
-        bytes32[] calldata proof
-    ) external nonReentrant {
-        _claim(escrow, amount, proof);
-    }
+    function rescueUnclaimable(address escrow, address to) external onlyAdmin {
+        if (to == address(0)) revert ZeroAddress();
+        RaiseReward storage reward = raiseRewards[escrow];
+        if (!reward.active) revert RewardNotActive();
+        require(reward.totalStakedSnapshot == 0, "Has stakers");
 
-    /**
-     * @notice Batch claim rewards across multiple raises
-     * @param claims Array of claim data
-     */
-    function claimMultiple(ClaimData[] calldata claims) external nonReentrant {
-        if (claims.length == 0) revert NoRewardsToClaim();
+        uint256 amount = reward.totalTokens - reward.claimedTokens;
+        if (amount == 0) revert NothingToClaim();
 
-        for (uint256 i = 0; i < claims.length; i++) {
-            // Skip if already claimed (don't revert, just continue)
-            if (hasClaimed[claims[i].escrow][msg.sender]) continue;
-
-            _claimInternal(claims[i].escrow, claims[i].amount, claims[i].proof);
-        }
-    }
-
-    /**
-     * @notice Internal claim logic
-     */
-    function _claim(
-        address escrow,
-        uint256 amount,
-        bytes32[] calldata proof
-    ) internal {
-        if (hasClaimed[escrow][msg.sender]) revert AlreadyClaimed();
-        _claimInternal(escrow, amount, proof);
-    }
-
-    /**
-     * @notice Internal claim implementation (shared by single and batch)
-     */
-    function _claimInternal(
-        address escrow,
-        uint256 amount,
-        bytes32[] calldata proof
-    ) internal {
-        RaiseRewards storage rewards = raiseRewards[escrow];
-
-        if (!rewards.rootSet) revert RootNotSet();
-        if (amount == 0) revert InvalidAmount();
-
-        // Verify Merkle proof
-        bytes32 leaf = keccak256(abi.encodePacked(msg.sender, amount));
-        if (!MerkleProof.verify(proof, rewards.merkleRoot, leaf)) {
-            revert InvalidProof();
-        }
-
-        // Mark as claimed
-        hasClaimed[escrow][msg.sender] = true;
-        rewards.claimedTokens += amount;
-
-        // Transfer tokens
-        IERC20(rewards.token).safeTransfer(msg.sender, amount);
-
-        emit RewardClaimed(msg.sender, escrow, rewards.token, amount);
+        reward.claimedTokens += amount;
+        IERC20(reward.token).safeTransfer(to, amount);
     }
 
     // ============================================
@@ -256,49 +358,70 @@ contract VibesStakerRewards is ReentrancyGuard {
      * @notice Check if a staker can claim for a specific raise
      * @param escrow Escrow address
      * @param staker Staker address
-     * @param amount Expected amount
-     * @param proof Merkle proof
-     * @return canClaim True if claim would succeed
+     * @return canClaimReward True if claim would succeed
+     * @return amount Estimated claimable amount
      */
     function canClaim(
         address escrow,
-        address staker,
-        uint256 amount,
-        bytes32[] calldata proof
-    ) external view returns (bool canClaim) {
-        RaiseRewards storage rewards = raiseRewards[escrow];
+        address staker
+    ) external view returns (bool canClaimReward, uint256 amount) {
+        RaiseReward storage reward = raiseRewards[escrow];
 
-        if (!rewards.rootSet) return false;
-        if (hasClaimed[escrow][staker]) return false;
-        if (amount == 0) return false;
+        if (!reward.active) return (false, 0);
+        if (hasClaimed[escrow][staker]) return (false, 0);
+        if (reward.totalStakedSnapshot == 0) return (false, 0);
 
-        bytes32 leaf = keccak256(abi.encodePacked(staker, amount));
-        return MerkleProof.verify(proof, rewards.merkleRoot, leaf);
+        // Read staker balance (view-only — doesn't cache)
+        uint256 stakerBal;
+        if (snapshotTaken[escrow][staker]) {
+            stakerBal = stakerSnapshot[escrow][staker];
+        } else {
+            // Check eligibility: must have been staking before notification
+            uint256 stakerFirstStake = IVibesStakingReadOnly(stakingContract).firstStakeTime(staker);
+            if (stakerFirstStake == 0 || stakerFirstStake >= reward.notifiedAt) return (false, 0);
+            // Audit fix F4: Use snapshot balance for accurate view
+            uint256 snapId = raiseSnapshotId[escrow];
+            if (snapId > 0) {
+                stakerBal = IVibesStakingSnapshot(stakingContract).balanceAtSnapshot(snapId, staker);
+            } else {
+                stakerBal = IVibesStakingReadOnly(stakingContract).stakedBalance(staker);
+            }
+        }
+
+        if (stakerBal == 0) return (false, 0);
+
+        amount = (stakerBal * reward.totalTokens) / reward.totalStakedSnapshot;
+        if (amount == 0) return (false, 0);
+
+        return (true, amount);
     }
 
     /**
      * @notice Get rewards info for a raise
      * @param escrow Escrow address
      * @return token Vibetoken address
-     * @return merkleRoot Merkle root
      * @return totalTokens Total allocated
      * @return claimedTokens Total claimed
-     * @return rootSet Whether root is set
+     * @return totalStakedSnapshot Total staked at notification
+     * @return notifiedAt Timestamp of notification
+     * @return active Whether reward is active
      */
     function getRewardsInfo(address escrow) external view returns (
         address token,
-        bytes32 merkleRoot,
         uint256 totalTokens,
         uint256 claimedTokens,
-        bool rootSet
+        uint256 totalStakedSnapshot,
+        uint256 notifiedAt,
+        bool active
     ) {
-        RaiseRewards storage rewards = raiseRewards[escrow];
+        RaiseReward storage reward = raiseRewards[escrow];
         return (
-            rewards.token,
-            rewards.merkleRoot,
-            rewards.totalTokens,
-            rewards.claimedTokens,
-            rewards.rootSet
+            reward.token,
+            reward.totalTokens,
+            reward.claimedTokens,
+            reward.totalStakedSnapshot,
+            reward.notifiedAt,
+            reward.active
         );
     }
 
@@ -347,4 +470,34 @@ contract VibesStakerRewards is ReentrancyGuard {
             claimed[i] = hasClaimed[escrows[i]][staker];
         }
     }
+
+    /**
+     * @notice Get claimable amounts for a staker across multiple raises
+     * @param staker Staker address
+     * @param escrows Array of escrow addresses to check
+     * @return amounts Array of claimable token amounts
+     */
+    function getClaimableAmounts(
+        address staker,
+        address[] calldata escrows
+    ) external view returns (uint256[] memory amounts) {
+        amounts = new uint256[](escrows.length);
+        for (uint256 i = 0; i < escrows.length; i++) {
+            (, amounts[i]) = this.canClaim(escrows[i], staker);
+        }
+    }
+}
+
+/// @notice Minimal read-only interface for VibesStaking
+interface IVibesStakingReadOnly {
+    function stakedBalance(address staker) external view returns (uint256);
+    function totalStaked() external view returns (uint256);
+    function firstStakeTime(address staker) external view returns (uint256);
+}
+
+/// @notice Audit fix F4: Snapshot interface for VibesStaking
+interface IVibesStakingSnapshot {
+    function takeSnapshot() external returns (uint256);
+    function balanceAtSnapshot(uint256 snapshotId, address staker) external view returns (uint256);
+    function totalStakedAtSnapshot(uint256 snapshotId) external view returns (uint256);
 }

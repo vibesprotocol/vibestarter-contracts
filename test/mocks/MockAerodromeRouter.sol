@@ -5,12 +5,49 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 /// @title MockLPToken
-/// @notice Simple ERC20 to represent LP tokens in tests
+/// @notice LP token that also implements the minimal IAerodromePool surface
+///         (token0/token1/stable/claimFees) so EIP-1167 clones of VibesLPFeeClaimer
+///         can initialize against it in unit tests.
 contract MockLPToken is ERC20 {
-    constructor() ERC20("Mock LP", "MLP") {}
+    address public immutable token0;
+    address public immutable token1;
+    bool public constant stable = false;
+
+    // Fee simulation for claim-path tests: set via setClaimableFees(), paid out (and zeroed)
+    // on the next claimFees() call. The pool must be pre-funded with the corresponding
+    // token balances by the test setup for the payout transfers to succeed.
+    uint256 public claimable0;
+    uint256 public claimable1;
+
+    constructor(address _token0, address _token1) ERC20("Mock LP", "MLP") {
+        token0 = _token0;
+        token1 = _token1;
+    }
 
     function mint(address to, uint256 amount) external {
         _mint(to, amount);
+    }
+
+    /// @notice Test helper — configure the next claimFees() payout.
+    function setClaimableFees(uint256 _c0, uint256 _c1) external {
+        claimable0 = _c0;
+        claimable1 = _c1;
+    }
+
+    /// @notice Mock of Aerodrome pool.claimFees() — pays out stored amounts to msg.sender
+    ///         and resets. Requires the pool to hold sufficient token0/token1 balances.
+    function claimFees() external returns (uint256 claimed0, uint256 claimed1) {
+        claimed0 = claimable0;
+        claimed1 = claimable1;
+        claimable0 = 0;
+        claimable1 = 0;
+
+        if (claimed0 > 0) {
+            IERC20(token0).transfer(msg.sender, claimed0);
+        }
+        if (claimed1 > 0) {
+            IERC20(token1).transfer(msg.sender, claimed1);
+        }
     }
 }
 
@@ -63,7 +100,7 @@ contract MockAerodromeRouter {
         // Create or get pool
         address pool = tokenPools[token];
         if (pool == address(0)) {
-            MockLPToken lpToken = new MockLPToken();
+            MockLPToken lpToken = new MockLPToken(token, weth);
             pool = address(lpToken);
             tokenPools[token] = pool;
         }

@@ -17,6 +17,9 @@ contract VibesTranchEscrowFactory {
     /// @notice Platform admin address
     address public admin;
 
+    /// @notice Pending admin for two-step transfer (L7 fix)
+    address public pendingAdmin;
+
     /// @notice Platform wallet for fees
     address public platformWallet;
 
@@ -28,6 +31,9 @@ contract VibesTranchEscrowFactory {
 
     /// @notice LP locker address
     address public lpLocker;
+
+    /// @notice Trusted signer for terms acceptance (passed to new escrows)
+    address public trustedSigner;
 
     /// @notice All deployed escrows
     address[] public escrows;
@@ -53,6 +59,7 @@ contract VibesTranchEscrowFactory {
     event PlatformWalletUpdated(address indexed oldWallet, address indexed newWallet);
     event TimeOracleUpdated(address indexed oldOracle, address indexed newOracle);
     event AuthorizedRouterUpdated(address indexed oldRouter, address indexed newRouter);
+    event TrustedSignerUpdated(address indexed oldSigner, address indexed newSigner);
 
     // ============ Constants ============
 
@@ -92,13 +99,15 @@ contract VibesTranchEscrowFactory {
     /// @param _timeOracle Time oracle (0x0 for production)
     /// @param _authorizedRouter Router authorized for LP withdrawals
     /// @param _lpLocker LP locker address
+    /// @param _trustedSigner Backend signer for terms acceptance (address(0) = gating disabled)
     constructor(
         address _implementation,
         address _admin,
         address _platformWallet,
         address _timeOracle,
         address _authorizedRouter,
-        address _lpLocker
+        address _lpLocker,
+        address _trustedSigner
     ) {
         if (_implementation == address(0)) revert ZeroAddress();
         if (_admin == address(0)) revert ZeroAddress();
@@ -112,6 +121,7 @@ contract VibesTranchEscrowFactory {
         timeOracle = _timeOracle;
         authorizedRouter = _authorizedRouter;
         lpLocker = _lpLocker;
+        trustedSigner = _trustedSigner;
     }
 
     // ============ Factory Functions ============
@@ -162,7 +172,8 @@ contract VibesTranchEscrowFactory {
             platformWallet,
             timeOracle,
             authorizedRouter,
-            lpLocker
+            lpLocker,
+            trustedSigner
         );
 
         // Track the escrow
@@ -186,12 +197,19 @@ contract VibesTranchEscrowFactory {
 
     // ============ Admin Functions ============
 
-    /// @notice Update admin address
+    /// @notice L7 fix: two-step admin transfer (step 1: propose)
     function setAdmin(address _newAdmin) external onlyAdmin {
         if (_newAdmin == address(0)) revert ZeroAddress();
+        pendingAdmin = _newAdmin;
+    }
+
+    /// @notice L7 fix: two-step admin transfer (step 2: accept)
+    function acceptAdmin() external {
+        require(msg.sender == pendingAdmin, "Not pending admin");
         address oldAdmin = admin;
-        admin = _newAdmin;
-        emit AdminUpdated(oldAdmin, _newAdmin);
+        admin = pendingAdmin;
+        pendingAdmin = address(0);
+        emit AdminUpdated(oldAdmin, admin);
     }
 
     /// @notice Update platform wallet
@@ -221,6 +239,14 @@ contract VibesTranchEscrowFactory {
     function setLPLocker(address _newLPLocker) external onlyAdmin {
         if (_newLPLocker == address(0)) revert ZeroAddress();
         lpLocker = _newLPLocker;
+    }
+
+    /// @notice Update trusted signer for new escrows
+    /// @param _newSigner New signer address (address(0) disables gating for new escrows)
+    function setTrustedSigner(address _newSigner) external onlyAdmin {
+        address oldSigner = trustedSigner;
+        trustedSigner = _newSigner;
+        emit TrustedSignerUpdated(oldSigner, _newSigner);
     }
 
     // ============ View Functions ============

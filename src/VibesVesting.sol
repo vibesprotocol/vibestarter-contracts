@@ -2,16 +2,19 @@
 pragma solidity ^0.8.20;
 
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * @title VibesVesting
- * @notice Linear vesting contract for founder token allocations with optional cliff.
- * @dev Tokens vest linearly over a specified duration (default 12 months).
- *      Optional cliff period: no tokens vest until cliff passes, then linear from start.
+ * @notice Linear vesting contract for founder token allocations with configurable cliff.
+ * @dev Tokens vest over CLIFF + VESTING_DURATION total. True delayed start — at the cliff
+ *      boundary, 0% is vested. Tokens then vest linearly from 0% to 100% over VESTING_DURATION.
+ *      Mainnet: 6-month cliff + 12-month linear = 18 months. Testnet: 6-day cliff + 12-day linear = 18 days.
  *      Founder can claim vested tokens at any time via release().
  */
 contract VibesVesting is ReentrancyGuard {
+    using SafeERC20 for IERC20;
     // ============================================
     // EVENTS
     // ============================================
@@ -19,6 +22,17 @@ contract VibesVesting is ReentrancyGuard {
     event TokensReleased(address indexed beneficiary, uint256 amount);
     event VestingStarted(uint256 startTime);
     event VestingInitialized(uint256 totalAmount);
+    event VestingFrozen(address indexed frozenBy, uint256 unvestedAmount);
+
+    // ============================================
+    // IMMUTABLES (configurable per deployment)
+    // ============================================
+
+    /// @notice Cliff period before any tokens vest (mainnet: 180 days, testnet: 6 days)
+    uint256 public immutable CLIFF;
+
+    /// @notice Linear vesting duration after cliff ends (mainnet: 365 days, testnet: 6 days)
+    uint256 public immutable VESTING_DURATION;
 
     // ============================================
     // STATE
@@ -36,13 +50,6 @@ contract VibesVesting is ReentrancyGuard {
     /// @notice Timestamp when vesting starts (set when campaign is funded)
     uint256 public start;
 
-    /// @notice Duration of vesting in seconds
-    uint256 public immutable duration;
-
-    /// @notice Cliff period in seconds (0 = no cliff)
-    /// @dev No tokens are releasable until start + cliff. After cliff, vesting is linear from start.
-    uint256 public immutable cliff;
-
     /// @notice Total amount of tokens to vest
     uint256 public totalAmount;
 
@@ -52,6 +59,12 @@ contract VibesVesting is ReentrancyGuard {
     /// @notice Whether the total amount has been set
     bool public initialized;
 
+    /// @notice Whether vesting has been frozen (malicious/abandoned founder)
+    bool public frozen;
+
+    /// @notice Address authorized to freeze vesting (treasury escrow)
+    address public authorizedFreezer;
+
     // ============================================
     // CONSTRUCTOR
     // ============================================
@@ -59,27 +72,26 @@ contract VibesVesting is ReentrancyGuard {
     /**
      * @param _token Token to vest
      * @param _beneficiary Address that will receive vested tokens
-     * @param _duration Vesting duration in seconds (e.g., 365 days for 1 year)
-     * @param _cliff Cliff period in seconds (0 = no cliff, e.g., 90 days)
+     * @param _cliff Cliff period in seconds (mainnet: 180 days, testnet: 6 days)
+     * @param _vestingDuration Linear vesting duration in seconds (mainnet: 365 days, testnet: 12 days)
      */
     constructor(
         address _token,
         address _beneficiary,
-        uint256 _duration,
-        uint256 _cliff
+        uint256 _cliff,
+        uint256 _vestingDuration
     ) {
         require(_token != address(0), "Invalid token");
         require(_beneficiary != address(0), "Invalid beneficiary");
-        require(_duration > 0, "Invalid duration");
-        require(_cliff <= _duration, "Cliff exceeds duration");
+        require(_vestingDuration > 0, "Invalid duration");
 
         token = IERC20(_token);
         beneficiary = _beneficiary;
+        CLIFF = _cliff;
+        VESTING_DURATION = _vestingDuration;
         authorizedStarter = msg.sender; // The router that deploys this contract
         // start is NOT set here - it's set when startVesting() is called
         // This ensures vesting begins when campaign is funded, not at deployment
-        duration = _duration;
-        cliff = _cliff;
     }
 
     // ============================================
@@ -91,7 +103,9 @@ contract VibesVesting is ReentrancyGuard {
      * @dev Must be called after tokens are transferred to this contract.
      *      Can only be called once. Sets totalAmount to current balance.
      */
+    // L11 fix: restrict to authorized starter (the router that deployed this contract)
     function initializeAmount() external {
+        require(msg.sender == authorizedStarter, "Only authorized starter");
         require(!initialized, "Already initialized");
 
         uint256 balance = token.balanceOf(address(this));
@@ -118,6 +132,37 @@ contract VibesVesting is ReentrancyGuard {
         emit VestingStarted(start);
     }
 
+    /**
+     * @notice Set the address authorized to freeze vesting (treasury escrow)
+     * @dev Only callable by the authorized starter (router). Can only be set once.
+     */
+    function setAuthorizedFreezer(address _freezer) external {
+        require(msg.sender == authorizedStarter, "Only authorized starter");
+        require(_freezer != address(0), "Invalid freezer");
+        require(authorizedFreezer == address(0), "Freezer already set");
+        authorizedFreezer = _freezer;
+    }
+
+    /**
+     * @notice Freeze vesting — burns unvested tokens, prevents future releases
+     * @dev Called by treasury escrow when a malicious/abandoned challenge is upheld.
+     *      Already-released tokens are unaffected.
+     */
+    function freeze() external {
+        require(msg.sender == authorizedFreezer, "Only authorized freezer");
+        require(!frozen, "Already frozen");
+
+        frozen = true;
+
+        // Burn all unvested tokens still held by this contract
+        uint256 balance = token.balanceOf(address(this));
+        if (balance > 0) {
+            token.safeTransfer(address(0xdead), balance);
+        }
+
+        emit VestingFrozen(msg.sender, balance);
+    }
+
     // ============================================
     // RELEASE FUNCTIONS
     // ============================================
@@ -128,13 +173,15 @@ contract VibesVesting is ReentrancyGuard {
      */
     function release() external nonReentrant {
         require(initialized, "Not initialized");
+        require(!frozen, "Vesting frozen");
 
         uint256 unreleased = releasable();
         require(unreleased > 0, "Nothing to release");
 
         released += unreleased;
 
-        require(token.transfer(beneficiary, unreleased), "Transfer failed");
+        // L10 fix: use safeTransfer for non-standard ERC20 compatibility
+        token.safeTransfer(beneficiary, unreleased);
 
         emit TokensReleased(beneficiary, unreleased);
     }
@@ -145,17 +192,20 @@ contract VibesVesting is ReentrancyGuard {
 
     /**
      * @notice Calculate amount of tokens that have vested
-     * @dev If cliff is set, returns 0 until cliff passes. After cliff, linear from start.
+     * @dev True delayed start: 0% at cliff end, then linear over VESTING_DURATION.
+     *      At start + CLIFF: vested = 0
+     *      At start + CLIFF + VESTING_DURATION: vested = totalAmount
      * @return Amount of vested tokens (may include already released)
      */
     function vestedAmount() public view returns (uint256) {
         if (!initialized) return 0;
         if (start == 0) return 0; // Vesting hasn't started yet
-        if (block.timestamp < start) return 0;
-        if (block.timestamp < start + cliff) return 0; // Before cliff: nothing vested
-        if (block.timestamp >= start + duration) return totalAmount;
+        if (block.timestamp < start + CLIFF) return 0; // During cliff: nothing vested
 
-        return (totalAmount * (block.timestamp - start)) / duration;
+        uint256 elapsed = block.timestamp - start - CLIFF; // Time since cliff ended
+        if (elapsed >= VESTING_DURATION) return totalAmount; // Fully vested
+
+        return (totalAmount * elapsed) / VESTING_DURATION; // Linear from cliff end
     }
 
     /**
@@ -168,14 +218,17 @@ contract VibesVesting is ReentrancyGuard {
 
     /**
      * @notice Get vesting progress as percentage (basis points)
+     * @dev Progress across the full 18-month period (CLIFF + VESTING_DURATION)
      * @return Progress in basis points (0-10000)
      */
     function vestingProgress() external view returns (uint256) {
         if (!initialized) return 0;
         if (start == 0) return 0; // Vesting hasn't started yet
-        if (block.timestamp >= start + duration) return 10000;
+        uint256 totalDuration = CLIFF + VESTING_DURATION;
+        if (block.timestamp >= start + totalDuration) return 10000;
+        if (block.timestamp <= start) return 0;
 
-        return ((block.timestamp - start) * 10000) / duration;
+        return ((block.timestamp - start) * 10000) / totalDuration;
     }
 
     /**
@@ -183,7 +236,7 @@ contract VibesVesting is ReentrancyGuard {
      * @return Seconds until fully vested (0 if already vested)
      */
     function remainingTime() external view returns (uint256) {
-        uint256 end = start + duration;
+        uint256 end = start + CLIFF + VESTING_DURATION;
         if (block.timestamp >= end) return 0;
         return end - block.timestamp;
     }
@@ -191,7 +244,7 @@ contract VibesVesting is ReentrancyGuard {
     /**
      * @notice Get vesting schedule details
      * @return _start Start timestamp
-     * @return _duration Duration in seconds
+     * @return _duration Total duration in seconds (CLIFF + VESTING_DURATION)
      * @return _cliff Cliff period in seconds
      * @return _totalAmount Total tokens to vest
      * @return _released Tokens already released
@@ -205,6 +258,6 @@ contract VibesVesting is ReentrancyGuard {
         uint256 _released,
         uint256 _releasable
     ) {
-        return (start, duration, cliff, totalAmount, released, releasable());
+        return (start, CLIFF + VESTING_DURATION, CLIFF, totalAmount, released, releasable());
     }
 }

@@ -60,6 +60,28 @@ Which would you pick? Or is there a fourth option we missed?
 
 Severity feels like Medium grief (slow leak, not a one-shot drain). Right call, or worse than I think? And: read `lpLocker.campaignToFeeClaimer(address(this))` lazily inside the calc, or have the router push the address at finalization (mirroring how `treasuryContract` is wired)?
 
+### 3. Known: LP-sniping on small-softcap raises (observed empirically)
+
+Not asking you to fix this — flagging it as a "known and accepted for now" so it doesn't surprise you. We ran a tiny smoke-test raise on Base mainnet (0.01 ETH softcap, 1B supply, 15% LP allocation = 0.0015 ETH + 150M tokens initial Aerodrome volatile-pool reserves). Within 64 blocks (~2 min) of `finalize()` confirming, two off-the-shelf sniper bots watching `PoolCreated` events on the Aerodrome factory drained ~14.6% of total supply for ~$180:
+
+- Bot A spent 0.0099 ETH and got **130.2M MAIN** (87% of LP-side tokens) on its first buy
+- Bot A spent another 0.0495 ETH for 16M more MAIN
+- Bot B did a tiny round-trip and broke even
+
+The math is just `x*y=k` against a microscopic pool — `0.0114 ETH × (150M − X) = 225,000` solves to `X = 130M`. Not a contract bug, a **liquidity-scale property** of small launches.
+
+**Why we're shipping anyway:**
+- The $VIBES TGE softcap is 100 ETH, so initial LP would be 15 ETH paired with 15% of supply. A bot with $200 buys ~0.13% of LP-side tokens, not 87%. Cost-benefit collapses for any meaningful raise size.
+- We document the risk as part of the founder onboarding flow.
+- Internal recommendation will be "don't launch with a softcap below ~5 ETH on mainnet" until we have a mitigation.
+
+**What I'd love your read on:**
+- Is the liquidity-scale argument sufficient, or are there second-order attacks (e.g. sandwich the LP-creation tx itself, not just frontrun the next block) we should pressure-test? The finalize tx is on the public mempool today — Base doesn't have a widely-adopted Flashbots equivalent.
+- Worth investing in private-mempool submission of `finalize()` (Tenderly Web3 Gateway / similar) for v1, or wait until smaller raises become a use case?
+- Is there an in-token mitigation that doesn't break composability with Aerodrome / aggregators? (Max-buy-per-wallet for first N blocks is the standard pattern but has its own downsides.)
+
+This is exactly the kind of thing the audit-prep doc doesn't currently flag — too late-stage when it was written. Adding here for visibility.
+
 ---
 
 ## How to run things locally

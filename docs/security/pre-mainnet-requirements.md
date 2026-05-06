@@ -218,3 +218,49 @@ These affect existing testnet deployments and cannot be fixed without redeployme
 | Vesting duration = 6 days | VibesVesting | Full vest in 7 days instead of 18 | Display only — no frontend fix possible |
 
 These are testnet-only issues. Mainnet contracts will use correct values. The frontend enforcement is a best-effort UI gate — direct contract interaction can bypass it.
+
+---
+
+## 9. Sanctions Screening — Chainalysis oracle not on Base (discovered 2026-05-06)
+
+**Status:** Open compliance gap. Acknowledged in `docs/audits/pre-mainnet-friend-review-2026-05.md` § "Known: LP-sniping". Blocking for any production exposure to non-team users; unblocked for the internal-team mainnet test phase.
+
+The frontend's sanctions screen at `apps/web/src/lib/sanctions-screening.ts` calls `isSanctioned(address)` on the Chainalysis Sanctions Oracle at the canonical CREATE2 address `0x40C57923924B5c5c5455c48D93317139ADDaC8fb`. Chainalysis uses the same address across every chain they support, but **they have not deployed the oracle on Base** — `cast code` returns empty bytecode at that address on chain 8453. We confirmed this onchain on 2026-05-06 against the live chain.
+
+### What used to happen (pre-2026-05-06)
+
+Code path on chain 8453 with no bytecode at the oracle:
+1. `client.readContract({ address: ORACLE, ... })` throws `"contract does not have any code"`
+2. The catch in `screenWallet` logs ERROR + writes a SanctionsScreening audit row with `result=ERROR`
+3. Returns `{ ok: false, result: 'ERROR' }` — fail-closed
+4. Every gated entry point returns 403: `terms-sign`, `launch-sign`, `applications`, `allowlist-signup`, `legal-accept`
+5. Every wallet on Base mainnet was blocked from any gated user action
+
+### What now happens (post-fix at commit `583b4c32`)
+
+Pre-flight `client.getBytecode({ address: ORACLE })` check before the read. If empty, treat as SKIPPED — same as the non-mainnet path — and log a loud `console.error` so Sentry captures it. If Chainalysis ever does deploy on Base at the canonical address, the bytecode check flips and screening resumes automatically without a code change.
+
+### What this means for production
+
+**No programmatic SDN screening on Base.** Two paths to close before opening to non-team users:
+
+**Option A: Wire an alternative on-chain or off-chain mechanism.**
+- Off-chain SDN list (OFAC publishes a JSON file) — would need to be loaded server-side and refreshed periodically. Adds DB / cache complexity.
+- Chainalysis has a paid REST API (`api.chainalysis.com`) that doesn't require an on-chain oracle. Cleanest swap-in. Costs subscription fees.
+- Subscribe to a different on-chain oracle if/when one becomes available on Base.
+
+**Option B: Accept the gap and document it.**
+- Pre-flight legal review on whether the platform's other compliance controls (terms-of-service, geoblock, hosted-payment-rails layer) are sufficient.
+- Update the legal stack (`/terms`, `/risk-disclosure`) to be explicit about how SDN status is screened.
+- Tag this as a known accepted risk in the audit handoff.
+
+For the **2026-05-06 mainnet test phase**: gap is accepted. Only team wallets transact; no real users behind the screen.
+
+For **$VIBES TGE / public production**: this is **P0 blocking**. Either A or B must be resolved with sign-off before any non-team user is allowed to interact with `/terms/sign`.
+
+### Action Items
+
+- [ ] Decide: integrate Chainalysis REST API, switch to off-chain SDN list, or accept-with-write-up
+- [ ] If A: implement + add to `apps/web/src/lib/sanctions-screening.ts` as a parallel path; keep on-chain oracle check as fallback for if/when Chainalysis deploys on Base
+- [ ] If B: legal review + write-up in `docs/compliance/decisions-log.md`
+- [ ] Either way: add a Sentry alert rule on the existing `Chainalysis oracle has no code` console.error to track if Chainalysis ever deploys (would let us flip back to on-chain screening)

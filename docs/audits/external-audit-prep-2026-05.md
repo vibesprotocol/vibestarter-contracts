@@ -325,6 +325,15 @@ PC-01 through PC-05 + the LP fee claimer all landed AFTER the 2026-04-15 interna
 - `VibesTranchEscrow.transferAdmin` / `acceptAdmin`, factory, treasury, LP locker, router, staker rewards
 - Confirm the pendingAdmin slot can't be set to address(0) and accept by anyone.
 
+**3.5 `factory.lockTimeOracle()` one-way latch (added 2026-05-07)**
+- `VibesTranchEscrowFactory.sol::lockTimeOracle()` — admin-only, single-shot, sets `bool timeOracleLocked = true`. After this call, `setTimeOracle` reverts permanently.
+- Motivation: surfaced by self-conducted adversarial test (`docs/security/adversarial-test-2026-05.md` § ADV-02). On mainnet there's no operational reason to ever rotate the time source post-deploy — `timeOracle = address(0)` (= `block.timestamp`) is the production answer. The lock removes the rotation attack surface entirely. Existing audit fix H-06 (`MAX_TIME_DRIFT = 1 hours` upper bound) caps forward warp on the unlocked path, so the residual surface is griefing-only on FUTURE raises — but the lock removes even that.
+- Pre-mainnet runbook: post-deploy Safe call to `factory.lockTimeOracle()`, gated on `factory.timeOracle() == address(0)` pre-condition. Documented in `docs/first-mainnet-deployment.md` § "Post-deploy hardening" item 5.
+- Auditor ask:
+  - Confirm the latch is genuinely one-way (no path to flip back to `false`).
+  - Confirm there's no escrow-side path that re-derives `timeOracle` from the factory after lock (per-clone state is read once during `initialize`; we believe nothing else reads from factory storage post-init).
+  - Sanity-check that the testnet variant (`VibesTranchEscrowFactoryTestnet.sol`) is intentionally unaffected — testnet needs to be able to rotate the mock oracle for fast-forwarding; the lock would brick that.
+
 ### TIER 4 — lower priority but worth a skim
 
 - `VibesRegistry.sol` — provenance-only, no fund flows. Confirm `VibesCertified` event is well-formed.

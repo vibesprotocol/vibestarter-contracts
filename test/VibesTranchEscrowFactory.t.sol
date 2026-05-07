@@ -218,6 +218,84 @@ contract VibesTranchEscrowFactoryTest is Test {
         assertEq(factory.timeOracle(), newOracle);
     }
 
+    // ============ lockTimeOracle ============
+
+    function test_lockTimeOracle_initiallyUnlocked() public view {
+        assertFalse(factory.timeOracleLocked(), "timeOracleLocked should default to false");
+    }
+
+    function test_lockTimeOracle_setsLatch() public {
+        vm.prank(admin);
+        factory.lockTimeOracle();
+        assertTrue(factory.timeOracleLocked(), "lockTimeOracle should latch the flag");
+    }
+
+    function test_lockTimeOracle_emitsEvent() public {
+        // Lock with the production-default value (address(0)) -- this is the expected
+        // post-deploy mainnet sequence.
+        vm.expectEmit(true, true, true, true);
+        emit VibesTranchEscrowFactory.TimeOracleLockedPermanently(address(0), admin);
+        vm.prank(admin);
+        factory.lockTimeOracle();
+    }
+
+    function test_lockTimeOracle_revertsOnDoubleCall() public {
+        vm.prank(admin);
+        factory.lockTimeOracle();
+        vm.prank(admin);
+        vm.expectRevert(VibesTranchEscrowFactory.TimeOracleAlreadyLocked.selector);
+        factory.lockTimeOracle();
+    }
+
+    function test_lockTimeOracle_revertsForNonAdmin() public {
+        vm.prank(stranger);
+        vm.expectRevert(VibesTranchEscrowFactory.OnlyAdmin.selector);
+        factory.lockTimeOracle();
+    }
+
+    function test_setTimeOracle_revertsAfterLock() public {
+        // Set a non-zero oracle first, then lock.
+        address oracle = makeAddr("oracle");
+        vm.prank(admin);
+        factory.setTimeOracle(oracle);
+        vm.prank(admin);
+        factory.lockTimeOracle();
+
+        // setTimeOracle is now permanently disabled.
+        vm.prank(admin);
+        vm.expectRevert(VibesTranchEscrowFactory.TimeOracleIsLocked.selector);
+        factory.setTimeOracle(makeAddr("differentOracle"));
+
+        // Locked value is preserved.
+        assertEq(factory.timeOracle(), oracle);
+    }
+
+    function test_setTimeOracle_revertsForNonAdminBeforeLock() public {
+        vm.prank(stranger);
+        vm.expectRevert(VibesTranchEscrowFactory.OnlyAdmin.selector);
+        factory.setTimeOracle(makeAddr("oracle"));
+    }
+
+    function test_lockTimeOracle_lockOnZeroIsThePostDeployMainnetFlow() public {
+        // Mirror the intended mainnet runbook: factory deployed with timeOracle=0
+        // then locked from the protocol-admin Safe so future raises can never inherit
+        // a malicious oracle. This test asserts that flow is reachable in one tx and
+        // produces the locked-at-zero state.
+        assertEq(factory.timeOracle(), address(0));
+        assertFalse(factory.timeOracleLocked());
+
+        vm.prank(admin);
+        factory.lockTimeOracle();
+
+        assertEq(factory.timeOracle(), address(0));
+        assertTrue(factory.timeOracleLocked());
+
+        // Confirm setTimeOracle is permanently disabled even with an admin caller.
+        vm.prank(admin);
+        vm.expectRevert(VibesTranchEscrowFactory.TimeOracleIsLocked.selector);
+        factory.setTimeOracle(makeAddr("evilOracle"));
+    }
+
     function test_setAuthorizedRouter() public {
         address newRouter = makeAddr("newRouter");
         vm.prank(admin);

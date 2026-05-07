@@ -24,7 +24,15 @@ contract VibesTranchEscrowFactory {
     address public platformWallet;
 
     /// @notice Time oracle (0x0 for production, mock for testnet)
+    /// @dev Once `timeOracleLocked` is set, this value is permanently frozen.
     address public timeOracle;
+
+    /// @notice One-way latch that permanently disables `setTimeOracle`.
+    /// @dev Set by admin via `lockTimeOracle()` post-deploy on mainnet to remove
+    ///      the time-oracle-rotation attack surface entirely. Once true, can never
+    ///      be unset — the only path back is a full factory redeploy. Testnet
+    ///      deployments leave this `false` so the mock oracle can be advanced.
+    bool public timeOracleLocked;
 
     /// @notice Authorized router for LP withdrawals
     address public authorizedRouter;
@@ -58,6 +66,8 @@ contract VibesTranchEscrowFactory {
     event AdminUpdated(address indexed oldAdmin, address indexed newAdmin);
     event PlatformWalletUpdated(address indexed oldWallet, address indexed newWallet);
     event TimeOracleUpdated(address indexed oldOracle, address indexed newOracle);
+    /// @notice Emitted when the time oracle is permanently frozen at its current value.
+    event TimeOracleLockedPermanently(address indexed lockedAt, address indexed admin);
     event AuthorizedRouterUpdated(address indexed oldRouter, address indexed newRouter);
     event TrustedSignerUpdated(address indexed oldSigner, address indexed newSigner);
 
@@ -78,6 +88,10 @@ contract VibesTranchEscrowFactory {
     error DeadlineTooFar();
     error RaiseStartInPast();
     error RaiseStartTooFar();
+    /// @notice Reverted when `setTimeOracle` is called after `lockTimeOracle` has been latched.
+    error TimeOracleIsLocked();
+    /// @notice Reverted when `lockTimeOracle` is called more than once.
+    error TimeOracleAlreadyLocked();
 
     // ============ Modifiers ============
 
@@ -220,11 +234,33 @@ contract VibesTranchEscrowFactory {
         emit PlatformWalletUpdated(oldWallet, _newWallet);
     }
 
-    /// @notice Update time oracle (for testnet deployments)
+    /// @notice Update time oracle (for testnet deployments).
+    /// @dev Reverts after `lockTimeOracle()` has been called. On mainnet, the deploy
+    ///      runbook calls `lockTimeOracle()` post-deploy so this setter is permanently
+    ///      disabled — there is no operational reason to ever rotate the time source
+    ///      on a production factory once `timeOracle = address(0)` is wired through.
     function setTimeOracle(address _newOracle) external onlyAdmin {
+        if (timeOracleLocked) revert TimeOracleIsLocked();
         address oldOracle = timeOracle;
         timeOracle = _newOracle;
         emit TimeOracleUpdated(oldOracle, _newOracle);
+    }
+
+    /// @notice Permanently lock the time oracle at its current value.
+    /// @dev One-way latch. After this call, `setTimeOracle` reverts forever and the
+    ///      only path back is a factory redeploy. Intended to be called once post-deploy
+    ///      on mainnet from the protocol-admin Safe (M-3) to remove the time-oracle-
+    ///      rotation attack surface from the compromised-admin threat model.
+    ///
+    ///      The escrow `_currentTime()` already enforces a 1h forward-drift bound (audit
+    ///      fix H-06), so the practical attack on the existing setter is bounded to ~1h
+    ///      forward + arbitrary backward warp on FUTURE escrows. This lock removes even
+    ///      that residual griefing surface for mainnet deployments. Testnet deployments
+    ///      should never call this — the mock oracle there needs to remain rotatable.
+    function lockTimeOracle() external onlyAdmin {
+        if (timeOracleLocked) revert TimeOracleAlreadyLocked();
+        timeOracleLocked = true;
+        emit TimeOracleLockedPermanently(timeOracle, msg.sender);
     }
 
     /// @notice Update authorized router

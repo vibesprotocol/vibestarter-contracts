@@ -284,13 +284,16 @@ contract SecurityAuditFixesTest is Test {
     // ============ M-02: Locked Address Overlap ============
 
     function test_M02_setLockedAddresses_revertsOnOverlap() public {
-        (address token, address escrowAddr) = _launchFixedGoal();
+        (, address escrowAddr) = _launchFixedGoal();
         VibesTranchEscrow escrow = VibesTranchEscrow(payable(escrowAddr));
 
-        // Fund and finalize so setLockedAddresses is available
-        _fundAndFinalize(token, escrow, backer1, GOAL);
+        // Post-ZXVC-VIB-02 (2026-05): the router latches custody addresses at the end of
+        // Phase 2, after which both setters revert with "Locked". The M-02 overlap check
+        // is now only reachable pre-finalisation (e.g., admin/router wiring before launch
+        // completes). Test it in that pre-finalisation window — don't fund-and-finalise.
+        require(!escrow.lockedAddressesFinalized(), "Pre-finalisation precondition");
 
-        // Try to set both vesting and staker to the same address — should revert
+        // Try to set both vesting and staker to the same address — should revert with M-02.
         address sameAddr = makeAddr("sameAddr");
         vm.prank(address(router));
         vm.expectRevert("Overlapping locked addresses");

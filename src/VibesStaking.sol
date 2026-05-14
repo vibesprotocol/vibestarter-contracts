@@ -117,6 +117,47 @@ contract VibesStaking is ReentrancyGuard, Ownable {
     /// @notice Contracts authorized to call takeSnapshot()
     mapping(address => bool) public snapshotAuthorized;
 
+    /// @notice ZXVC VIB-06 (2026-05): block.timestamp of each snapshot, used by
+    ///         VibesStakerRewards to detect same-block stakers (those whose first stake
+    ///         landed at or after the snapshot timestamp).
+    /// @dev 0 for snapshots taken before this storage existed (legacy). Consumers must
+    ///      treat 0 as "no timestamp recorded — skip same-block check" (fail-open for
+    ///      legacy compatibility; new raises will always have a non-zero timestamp).
+    mapping(uint256 => uint256) public snapshotTimestamps;
+
+    /// @notice ZXVC VIB-06 (2026-05): cumulative new-stake amount at each block timestamp.
+    /// @dev Incremented by `stake()` keyed on `block.timestamp`. Used by `takeSnapshot()`
+    ///      to subtract same-block new stakes from the snapshot total so that a staker who
+    ///      stakes immediately before a notifyReward call in the same block does NOT dilute
+    ///      pre-existing stakers. Only NEW stakes (not unstakes or re-stakes by users with
+    ///      existing balance) contribute to the dilution surface, so only stake() writes
+    ///      this — fine-grained enough to bound the gas + correct enough for the auditor's
+    ///      intent.
+    mapping(uint256 => uint256) public newStakeAtTimestamp;
+
+    /// @notice ZXVC VIB-06 (2026-05): the first ever block.timestamp at which `staker`
+    ///         opened a stake position. Set once on the staker's very first stake call;
+    ///         never modified thereafter (NOT reset on full unstake, unlike firstStakeTime).
+    /// @dev VibesStakerRewards uses this to determine "was this staker eligible at the
+    ///      snapshot" — comparing against snapshotTimestamps. firstStakeTime (which resets
+    ///      to 0 on full unstake) is unreliable for this purpose post-VIB-04. Both are
+    ///      kept: firstStakeTime is the current-session value used by UI / cooldown logic;
+    ///      everFirstStakeTime is the permanent historical record.
+    mapping(address => uint256) public everFirstStakeTime;
+
+    /// @notice ZXVC VIB-05 (2026-05): per-call cap on the eager snapshot backfill loop.
+    /// @dev Bounds the gas a stake/unstake transaction can spend in
+    ///      _writeSnapshotsBeforeBalanceChange. Without this cap, an attacker (or
+    ///      legitimate snapshot-heavy raise activity) could grow snapshot count between a
+    ///      staker's last balance change and their next action arbitrarily, OOG'ing their
+    ///      stake/unstake call. With the cap, stake/unstake reverts cleanly with
+    ///      `SnapshotBacklogTooDeep` instead of OOG. Stakers (or anyone) can call
+    ///      `catchUpSnapshots(staker, max)` repeatedly to clear backlog in MAX_BACKFILL-sized
+    ///      chunks before retrying stake/unstake. 50 is conservative — covers ~50 raises
+    ///      a year of inactivity without the staker hitting the wall, and bounds gas to
+    ///      ~50 SSTORE ops (~5k gas each = ~250k gas worst case).
+    uint256 public constant MAX_BACKFILL_PER_CALL = 50;
+
     // ============================================
     // ERRORS
     // ============================================
@@ -130,6 +171,10 @@ contract VibesStaking is ReentrancyGuard, Ownable {
     error InvalidSignature();
     error InvalidNonce();
     error NotSnapshotAuthorized();
+    /// @dev ZXVC VIB-05 (2026-05): thrown when a stake/unstake call would have to backfill
+    ///      more than MAX_BACKFILL_PER_CALL snapshots in one transaction. Call
+    ///      catchUpSnapshots(staker, max) to reduce the backlog first.
+    error SnapshotBacklogTooDeep(uint256 backlog);
 
     event TrustedSignerUpdated(address indexed oldSigner, address indexed newSigner);
     event SnapshotTaken(uint256 indexed snapshotId, uint256 totalStaked);
@@ -207,9 +252,15 @@ contract VibesStaking is ReentrancyGuard, Ownable {
         if (!snapshotAuthorized[msg.sender]) revert NotSnapshotAuthorized();
 
         currentSnapshotId++;
-        snapshotTotalStaked[currentSnapshotId] = totalStaked;
+        // ZXVC VIB-06 (2026-05): record the snapshot timestamp + subtract same-block
+        // new-stake amount so the eligible total at this snapshot reflects only
+        // stakers who were committed BEFORE this block.
+        snapshotTimestamps[currentSnapshotId] = block.timestamp;
+        uint256 sameBlockExcluded = newStakeAtTimestamp[block.timestamp];
+        uint256 eligibleTotal = totalStaked > sameBlockExcluded ? totalStaked - sameBlockExcluded : 0;
+        snapshotTotalStaked[currentSnapshotId] = eligibleTotal;
 
-        emit SnapshotTaken(currentSnapshotId, totalStaked);
+        emit SnapshotTaken(currentSnapshotId, eligibleTotal);
         return currentSnapshotId;
     }
 
@@ -292,6 +343,20 @@ contract VibesStaking is ReentrancyGuard, Ownable {
 
         if (current == 0 || lastWritten >= current) return; // No new snapshots to write
 
+        // ZXVC VIB-05 (2026-05): cap the eager backfill per call to bound gas. If the
+        // staker hasn't acted in a while and the snapshot count has grown past the cap,
+        // they must clear backlog with catchUpSnapshots first. This prevents OOG-DoS via
+        // adversarial snapshot inflation; the catchUp helper lets a third party (or the
+        // staker themselves) reduce backlog in MAX_BACKFILL-sized chunks across multiple
+        // txs. Read-side invariant preserved: lastSnapshotWritten still advances to
+        // `current` only when the entire range [lastWritten+1 .. current] is written,
+        // so _findSnapshotBalance's `snapshotId >= lastWritten → return current balance`
+        // short-circuit remains correct.
+        uint256 backlog = current - lastWritten;
+        if (backlog > MAX_BACKFILL_PER_CALL) {
+            revert SnapshotBacklogTooDeep(backlog);
+        }
+
         uint256 currentBalance = stakedBalance[staker];
         // Eager: write current balance to every snapshot since last write so the
         // read path can be O(1). Skip already-written slots to remain idempotent
@@ -304,6 +369,40 @@ contract VibesStaking is ReentrancyGuard, Ownable {
         }
 
         lastSnapshotWritten[staker] = current;
+    }
+
+    /// @notice ZXVC VIB-05 (2026-05): permissionlessly back-fill a staker's snapshot
+    ///         balance entries up to `max` snapshots forward. Used when the staker
+    ///         (or anyone helping them) needs to reduce a deep snapshot backlog before
+    ///         a stake / unstake / claim can land without hitting MAX_BACKFILL_PER_CALL.
+    /// @dev The invariant "balance hasn't changed since lastSnapshotWritten" holds because
+    ///      _writeSnapshotsBeforeBalanceChange runs on every stake/unstake — if a balance
+    ///      change happened since `lastSnapshotWritten[staker]`, the corresponding stake/
+    ///      unstake call would have either (a) succeeded and advanced lastSnapshotWritten,
+    ///      or (b) reverted with SnapshotBacklogTooDeep and not changed balance. Therefore
+    ///      the staker's CURRENT stakedBalance is the correct value to write to every
+    ///      snapshot in [lastSnapshotWritten+1 .. end].
+    /// @param staker The staker whose backlog to clear.
+    /// @param max Maximum snapshots to back-fill in this call. Pass MAX_BACKFILL_PER_CALL
+    ///        (or a higher bounded value if you're willing to pay the gas).
+    function catchUpSnapshots(address staker, uint256 max) external {
+        if (max == 0) return;
+        uint256 lastWritten = lastSnapshotWritten[staker];
+        uint256 current = currentSnapshotId;
+        if (current == 0 || lastWritten >= current) return;
+
+        uint256 end = lastWritten + max;
+        if (end > current) end = current;
+
+        uint256 currentBalance = stakedBalance[staker];
+        for (uint256 i = lastWritten + 1; i <= end; i++) {
+            if (!snapshotBalanceWritten[i][staker]) {
+                snapshotBalance[i][staker] = currentBalance;
+                snapshotBalanceWritten[i][staker] = true;
+            }
+        }
+
+        lastSnapshotWritten[staker] = end;
     }
 
     /**
@@ -328,12 +427,25 @@ contract VibesStaking is ReentrancyGuard, Ownable {
         if (stakedBalance[msg.sender] == 0) {
             firstStakeTime[msg.sender] = block.timestamp;
         }
+        // ZXVC VIB-06 (2026-05): record the permanent first-stake timestamp so
+        // VibesStakerRewards can correctly identify same-block stakers even after a
+        // full unstake + restake cycle (firstStakeTime resets to 0 on full unstake
+        // but everFirstStakeTime persists).
+        if (everFirstStakeTime[msg.sender] == 0) {
+            everFirstStakeTime[msg.sender] = block.timestamp;
+        }
 
         // Clear any pending unstake request (staking more = recommitment)
         if (unstakeRequestTime[msg.sender] != 0) {
             unstakeRequestTime[msg.sender] = 0;
             emit UnstakeRequestCancelled(msg.sender);
         }
+
+        // ZXVC VIB-06 (2026-05): accumulate same-block new-stake amount so a
+        // takeSnapshot at this same block can subtract these stakes from the eligible
+        // snapshot total — pre-existing stakers are not diluted by a stake that landed
+        // immediately before the notifyReward call.
+        newStakeAtTimestamp[block.timestamp] += amount;
 
         // Update state
         stakedBalance[msg.sender] += amount;

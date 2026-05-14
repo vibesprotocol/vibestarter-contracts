@@ -8,6 +8,7 @@ import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "./interfaces/ITimeOracle.sol";
 import "./interfaces/IVibesLaunchRouter.sol";
+import "./VibesLPLocker.sol";
 
 /// @title VibesTranchEscrow
 /// @notice Escrow contract with time-based tranche releases, challenge system, and admin controls
@@ -142,6 +143,14 @@ contract VibesTranchEscrow is ReentrancyGuard {
     // Audit fix H-04: LP creation verified flag — blocks tranche claims until LP is truly locked
     bool public lpCreated;
 
+    // ZXVC audit fix VIB-02 (2026-05): Once Phase 2 finalization is complete, custody addresses
+    // (vestingContract, stakerRewards, treasuryContract) become immutable. Without this latch a
+    // compromised admin could call setLockedAddresses with a victim's holder address as the
+    // "vesting" arg, exclude their balance from frozenTotalSupply, and extract a disproportionate
+    // share of frozenEthBalance via a self-favouring merkle root. See audit-2026-05/review.md
+    // (VIB-02) and Specialist3ManualAudit.t_POC_adminCanManipulateRefundDenominatorWithLockedAddressSetter.
+    bool public lockedAddressesFinalized;
+
     // Per-challenger cooldown to prevent serial challenge griefing (audit response)
     mapping(address => uint256) public lastChallengeTime;
     uint256 public constant CHALLENGE_COOLDOWN = 7 days;
@@ -194,6 +203,8 @@ contract VibesTranchEscrow is ReentrancyGuard {
     event FrozenBalanceRecorded(uint256 ethBalance, uint256 tokenSupply);
     event LockedAddressesUpdated(address vestingContract, address stakerRewards);
     event TreasuryContractUpdated(address treasuryContract);
+    // ZXVC audit fix VIB-02 (2026-05): emitted exactly once when the router latches custody addresses
+    event LockedAddressesFinalized();
     event MerkleRootCommitted(bytes32 merkleRoot, uint256 commitTime);
     event MerkleRootCancelled(bytes32 merkleRoot);
     event PlatformFeesAccrued(uint8 indexed tranche, uint256 amount);
@@ -374,7 +385,18 @@ contract VibesTranchEscrow is ReentrancyGuard {
     // ============ Supply Helper ============
 
     /// @dev Calculate redeemable token supply using known locked contract addresses
-    /// @notice Excludes tokens held by: dead address (LP), vesting, staker rewards, router, LP locker, and this escrow
+    /// @notice Excludes tokens held by: dead address (LP), vesting, staker rewards, router,
+    ///         LP locker, treasury, this escrow, AND (per ZXVC VIB-01 2026-05) the per-campaign
+    ///         fee claimer + canonical Aerodrome pool registered with the locker.
+    /// @dev ZXVC VIB-01 (2026-05): Reads canonical-pool and fee-claimer addresses LAZILY from
+    ///      the locker rather than via a setter. Adding a setter would create another VIB-02
+    ///      class admin-mutable exclusion path; the locker is the single source of truth for
+    ///      both addresses. try/catch handles pre-LP-lock state (campaignToFeeClaimer == 0)
+    ///      and rescued state (getLockedPosition reverts in those cases). NOTE: option (a)
+    ///      remediation scope — only excludes the CANONICAL pool recorded by the locker.
+    ///      A random ERC-20-holder address sitting on project tokens is still counted; the
+    ///      auditor's recommended end-state is the holder-only positive-list snapshot (option
+    ///      (b)), which is tracked as a separate follow-up.
     function _calculateRedeemableSupply() internal view returns (uint256) {
         IERC20 token = IERC20(campaign.token);
         uint256 totalSupply = token.totalSupply();
@@ -395,6 +417,31 @@ contract VibesTranchEscrow is ReentrancyGuard {
         }
         if (lpLocker != address(0)) {
             excludedBalance += token.balanceOf(lpLocker);
+
+            // ZXVC VIB-01 (2026-05): exclude per-campaign fee claimer + canonical Aerodrome
+            // pair via lazy locker reads. The code.length guard is required because Solidity
+            // 0.8.x try/catch does NOT catch ABI decoding failures — calls to an EOA return
+            // 0 bytes, then the decode reverts BEFORE the catch block runs. In production
+            // lpLocker is always a deployed contract; this guard makes the code defensive in
+            // every other configuration.
+            if (lpLocker.code.length > 0) {
+                // campaignToFeeClaimer is a public mapping; getter never reverts on the locker
+                // side. try/catch here is for forward-compat if the locker is ever replaced.
+                try VibesLPLocker(payable(lpLocker)).campaignToFeeClaimer(address(this)) returns (address feeClaimer) {
+                    if (feeClaimer != address(0)) {
+                        excludedBalance += token.balanceOf(feeClaimer);
+                    }
+                } catch { /* non-standard locker layout — skip */ }
+
+                // getLockedPosition reverts when !hasLockedLP || hasRescuedLP (pre-lock or
+                // rescued state). try/catch handles both — the canonical pool isn't recorded
+                // in those states, so excluding it would be wrong anyway.
+                try VibesLPLocker(payable(lpLocker)).getLockedPosition(address(this)) returns (VibesLPLocker.LockedLP memory pos) {
+                    if (pos.pool != address(0)) {
+                        excludedBalance += token.balanceOf(pos.pool);
+                    }
+                } catch { /* LP not yet locked, or rescued — pool is not canonical, skip */ }
+            }
         }
         // Audit fix F-2 (2026-04): exclude the treasury escrow — its allocation is custody, not circulating supply.
         if (treasuryContract != address(0)) {
@@ -883,6 +930,11 @@ contract VibesTranchEscrow is ReentrancyGuard {
         if (activeChallenge.state != ChallengeState.Pending) revert NoChallengeActive();
 
         activeChallenge.state = ChallengeState.Rejected;
+        // ZXVC VIB-08 (2026-05): clear the per-tranche challenge flag so a legitimate
+        // second challenger can still raise a new challenge on the same tranche after a
+        // collusive / rejected one. The per-challenger CHALLENGE_COOLDOWN + lastChallengeTime
+        // gates still bound abuse — each challenger can only raise once per CHALLENGE_COOLDOWN.
+        trancheChallenged[uint8(activeChallenge.tranche)] = false;
 
         // Calculate slash (20% of stake)
         uint256 slashAmount = (activeChallenge.amount * CHALLENGE_SLASH_BPS) / BPS_DENOMINATOR;
@@ -911,6 +963,9 @@ contract VibesTranchEscrow is ReentrancyGuard {
         if (_currentTime() > activeChallenge.timestamp + CHALLENGE_WINDOW) {
             // Auto-reject: return full stake (no slash for timeout)
             activeChallenge.state = ChallengeState.Rejected;
+            // ZXVC VIB-08 (2026-05): clear the per-tranche challenge flag — same reasoning as
+            // rejectChallenge(): an expired challenge must not consume the tranche's only slot.
+            trancheChallenged[uint8(activeChallenge.tranche)] = false;
             IERC20(campaign.token).safeTransfer(activeChallenge.challenger, activeChallenge.amount);
             emit ChallengeRejected(activeChallenge.challenger, uint8(activeChallenge.tranche), 0);
         }
@@ -1042,13 +1097,29 @@ contract VibesTranchEscrow is ReentrancyGuard {
     /// @notice Claim accumulated platform fees (pull pattern — audit fix)
     /// @dev Anyone can call, but fees always go to platformWallet. Uses pull pattern so a
     ///      reverting platformWallet cannot block founder tranche claims.
+    /// @dev ZXVC VIB-11 (2026-05): the previous guard blocked claimPlatformFees in Frozen
+    ///      and Refunding states. That was over-restrictive — freeze accounting already
+    ///      excludes pendingPlatformFees from frozenEthBalance (see freezeCampaign + the
+    ///      M-03 fix in _calculateRedeemableSupply), so claiming the pending fees post-
+    ///      freeze does not touch holder refund funds. The previous guard also bricked
+    ///      legitimate platform fees if a campaign was frozen between tranche claims.
+    ///      We keep the guard only for Failed (pre-launch refund) state, where the entire
+    ///      contract balance is owed back to contributors and platform fees should not
+    ///      have accrued anyway.
     function claimPlatformFees() external nonReentrant {
-        require(
-            campaign.state != CampaignState.Frozen &&
-            campaign.state != CampaignState.Refunding,
-            "Fees locked during refund"
-        );
+        require(campaign.state != CampaignState.Failed, "Fees locked during contributor refund");
+
+        // ZXVC Extra-1 (2026-05): cap fees at actual contract balance to handle pro-rata
+        // rounding overage. pendingPlatformFees can briefly exceed address(this).balance
+        // when the pro-rata excess-refund dust math claims more than the kickstart fee
+        // overhang reserved. Without this cap, claimPlatformFees reverts on the transfer
+        // and the fees stay permanently stranded — the auditor's
+        // EconomicMechanicsAudit.t_AUDIT_ProRataExcessRoundingCanOverstatePlatformFeeLiability
+        // PoC. Zeroing pendingPlatformFees regardless of the cap avoids re-stranding any
+        // rounding-shaped residue.
         uint256 fees = pendingPlatformFees;
+        uint256 bal = address(this).balance;
+        if (fees > bal) fees = bal;
         require(fees > 0, "No pending fees");
 
         pendingPlatformFees = 0;
@@ -1068,10 +1139,15 @@ contract VibesTranchEscrow is ReentrancyGuard {
 
     /// @notice Set known locked contract addresses for redeemable supply calculation
     /// @dev These addresses are excluded when calculating frozenTotalSupply (audit fix)
+    /// @dev ZXVC VIB-02 (2026-05): Reverts with "Locked" once Phase 2 has finalised. The router
+    ///      calls this during _executePhase2 then immediately calls finalizeLockedAddresses(),
+    ///      after which neither admin nor router can change vesting / stakerRewards.
     /// @param _vestingContract Founder vesting contract address
     /// @param _stakerRewards Staker rewards contract address
     function setLockedAddresses(address _vestingContract, address _stakerRewards) external {
         if (msg.sender != admin && msg.sender != authorizedRouter) revert OnlyAdmin();
+        // ZXVC VIB-02 (2026-05): custody addresses immutable after router finalisation
+        require(!lockedAddressesFinalized, "Locked");
         // Audit fix M-02: Prevent overlapping addresses that would double-count excluded balances
         if (_vestingContract != address(0) && _stakerRewards != address(0)) {
             require(_vestingContract != _stakerRewards, "Overlapping locked addresses");
@@ -1089,6 +1165,8 @@ contract VibesTranchEscrow is ReentrancyGuard {
     /// @param _treasuryContract Treasury escrow address (pass address(0) to unset).
     function setTreasuryContract(address _treasuryContract) external {
         if (msg.sender != admin && msg.sender != authorizedRouter) revert OnlyAdmin();
+        // ZXVC VIB-02 (2026-05): custody addresses immutable after router finalisation
+        require(!lockedAddressesFinalized, "Locked");
         // Prevent overlapping addresses that would double-count excluded balances
         if (_treasuryContract != address(0)) {
             require(_treasuryContract != vestingContract, "Overlaps vesting");
@@ -1099,6 +1177,20 @@ contract VibesTranchEscrow is ReentrancyGuard {
         }
         treasuryContract = _treasuryContract;
         emit TreasuryContractUpdated(_treasuryContract);
+    }
+
+    /// @notice Latch custody addresses so they cannot be changed again
+    /// @dev ZXVC VIB-02 (2026-05): one-shot, router-only. The router calls this from
+    ///      _executePhase2 immediately after wiring vesting / stakerRewards / treasury. Once
+    ///      latched, both setLockedAddresses and setTreasuryContract revert with "Locked".
+    ///      This closes the post-Phase-2 admin manipulation path that allowed a compromised
+    ///      admin to exclude a victim holder's balance from frozenTotalSupply and extract
+    ///      frozenEthBalance via a self-favouring merkle root.
+    function finalizeLockedAddresses() external {
+        if (msg.sender != authorizedRouter) revert OnlyRouter();
+        require(!lockedAddressesFinalized, "Already finalized");
+        lockedAddressesFinalized = true;
+        emit LockedAddressesFinalized();
     }
 
     /// @notice Commit a merkle root for holder refunds (step 1 of 2)

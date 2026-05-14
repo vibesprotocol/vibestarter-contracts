@@ -713,9 +713,8 @@ contract FullLifecycleIntegrationTest is Test {
         vm.expectRevert(VibesTranchEscrow.ChallengePending.selector);
         escrow.claimTranche(1);
 
-        // Set locked addresses so onchain supply calculation excludes them
-        vm.prank(owner);
-        escrow.setLockedAddresses(vestingAddr, stakerRewardsAddr);
+        // Locked addresses are already wired by the router during Phase 2 finalisation
+        // (and latched there by ZXVC VIB-02 fix). No manual call needed here.
 
         // Admin upholds the challenge (redeemable supply now calculated onchain)
         vm.prank(owner); // Factory-deployed escrow admin is the owner/deployer

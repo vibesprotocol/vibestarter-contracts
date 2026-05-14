@@ -93,6 +93,20 @@ contract VibesStakerRewards is ReentrancyGuard {
     /// @dev Taken atomically during notifyReward() to capture staker balances at notification time
     mapping(address => uint256) public raiseSnapshotId;
 
+    /// @notice ZXVC VIB-06 (2026-05): cumulative balanceAtSnapshot of stakers who have
+    ///         claimed for each raise. Used by rescueUnclaimable to determine whether all
+    ///         eligible stakers have already claimed — once eligibleClaimedShares reaches
+    ///         totalStakedSnapshot, the remaining tokens are pure rounding dust and can
+    ///         be rescued without depriving any staker.
+    mapping(address => uint256) public eligibleClaimedShares;
+
+    /// @notice ZXVC VIB-06 (2026-05): grace period after notify before admin can rescue
+    ///         unclaimed tokens regardless of eligibleClaimedShares progress. Backstop for
+    ///         stakers who never come back to claim — without this, dust stays stranded
+    ///         forever. 365 days is long enough that any active staker has been notified
+    ///         by the indexer / UI and chosen not to claim.
+    uint256 public constant RESCUE_DELAY = 365 days;
+
     // ============================================
     // ERRORS
     // ============================================
@@ -241,7 +255,18 @@ contract VibesStakerRewards is ReentrancyGuard {
         // Calculate proportional share: (stakerBalance / totalStaked) * totalTokens
         uint256 amount = (stakerBal * reward.totalTokens) / reward.totalStakedSnapshot;
 
-        if (amount == 0) return; // Rounding to zero for tiny stakes
+        if (amount == 0) {
+            // ZXVC VIB-06 (2026-05): even when the proportional share rounds to zero,
+            // still mark the claim as completed. Without this, a staker whose share is
+            // pure dust never increments eligibleClaimedShares, and rescueUnclaimable's
+            // "all eligible have claimed" condition can never trigger — locking the
+            // dust forever. Functionally a no-op for the staker (they got their full
+            // entitlement: zero tokens), and it lets the admin recover the stranded
+            // reward via rescueUnclaimable.
+            hasClaimed[escrow][staker] = true;
+            eligibleClaimedShares[escrow] += stakerBal;
+            return;
+        }
 
         // Cap to remaining balance (handles rounding dust on last claimer)
         uint256 remaining = IERC20(reward.token).balanceOf(address(this));
@@ -254,6 +279,10 @@ contract VibesStakerRewards is ReentrancyGuard {
         // Mark as claimed and transfer
         hasClaimed[escrow][staker] = true;
         reward.claimedTokens += amount;
+        // ZXVC VIB-06 (2026-05): track the cumulative eligible share that has been claimed.
+        // rescueUnclaimable uses this to decide when the remaining tokens are pure
+        // rounding dust (all eligible stakers have claimed their share).
+        eligibleClaimedShares[escrow] += stakerBal;
 
         IERC20(reward.token).safeTransfer(staker, amount);
 
@@ -265,35 +294,48 @@ contract VibesStakerRewards is ReentrancyGuard {
      * @dev Audit fix F4: Uses snapshot-based balance instead of current balance to prevent
      *      stakers from increasing their stake post-notification and claiming a larger share.
      *      On first call for a (escrow, staker) pair, reads from staking snapshot and caches.
-     *      Eligibility check: staker's firstStakeTime must be strictly before the raise's
-     *      notifiedAt timestamp.
+     *
+     *      ZXVC VIB-04 (2026-05): the previous firstStakeTime-vs-notifiedAt eligibility gate
+     *      locked out legitimate historical stakers — VibesStaking resets firstStakeTime to 0
+     *      on full unstake, so a staker who had a balance at notification but later fully
+     *      unstaked (or unstaked-then-restaked) had their reward permanently stranded even
+     *      though balanceAtSnapshot still records their pre-unstake stake. We now trust the
+     *      snapshot directly: if balanceAtSnapshot > 0 the staker is eligible, else not.
+     *      Stakers who never staked or started staking AFTER notify already have
+     *      balanceAtSnapshot == 0 so they are still correctly excluded — the firstStakeTime
+     *      gate was redundant in addition to being incorrect.
      */
     function _getStakerBalance(address escrow, address staker) internal returns (uint256) {
         if (snapshotTaken[escrow][staker]) {
             return stakerSnapshot[escrow][staker];
         }
 
-        // Check eligibility: staker must have been staking before this raise was notified
-        uint256 stakerFirstStake = IVibesStakingReadOnly(stakingContract).firstStakeTime(staker);
-        uint256 notifiedAt = raiseRewards[escrow].notifiedAt;
-        if (stakerFirstStake == 0 || stakerFirstStake >= notifiedAt) {
-            // Not staking, or started staking at/after notification — ineligible
-            stakerSnapshot[escrow][staker] = 0;
-            snapshotTaken[escrow][staker] = true;
-            return 0;
-        }
-
-        // Audit fix F4: Read balance from snapshot (notification-time balance), not current balance.
-        // This prevents gaming where a staker increases their position after notification.
-        // Audit fix L-3: The previous `snapId == 0` backwards-compatibility fallback read the
-        // current stakedBalance, which silently re-introduced the F4 late-stake gaming vector.
-        // Any raise reaching this code path MUST have a snapshot, since notifyReward() always
-        // invokes takeSnapshot() and stores a non-zero id. Fail closed if somehow it doesn't.
+        // Audit fix F4 + ZXVC VIB-04: Read balance from snapshot only. The snapshot was taken
+        // atomically with notifyReward, so it is the authoritative source of who was staking
+        // at notify time. Any raise reaching this code path MUST have a snapshot, since
+        // notifyReward() always invokes takeSnapshot() and stores a non-zero id.
         uint256 snapId = raiseSnapshotId[escrow];
         if (snapId == 0) revert NoSnapshotForRaise();
         uint256 balance = IVibesStakingSnapshot(stakingContract).balanceAtSnapshot(snapId, staker);
 
-        // Cache it
+        // ZXVC VIB-06 (2026-05): exclude same-block stakers. A staker whose VERY FIRST
+        // ever-stake landed at or after the snapshot timestamp shouldn't be eligible for
+        // this raise's rewards — they didn't have committed stake before notifyReward.
+        // We use everFirstStakeTime (not firstStakeTime, which resets on full unstake)
+        // so that legitimate historical stakers who later fully unstaked still pass.
+        // For raises notified BEFORE VIB-06 deployed, snapshotTimestamps returns 0 and
+        // we skip the check (fail-open, preserves historical claim eligibility).
+        if (balance > 0) {
+            uint256 snapTs = IVibesStakingSnapshot(stakingContract).snapshotTimestamps(snapId);
+            if (snapTs > 0) {
+                uint256 stakerEverFirst = IVibesStakingReadOnly(stakingContract).everFirstStakeTime(staker);
+                if (stakerEverFirst == 0 || stakerEverFirst >= snapTs) {
+                    balance = 0;
+                }
+            }
+        }
+
+        // Cache it (including the zero case so we don't re-read the snapshot for ineligible stakers)
         stakerSnapshot[escrow][staker] = balance;
         snapshotTaken[escrow][staker] = true;
 
@@ -332,8 +374,17 @@ contract VibesStakerRewards is ReentrancyGuard {
     }
 
     /**
-     * @notice Rescue tokens from raises where totalStaked was 0 (no stakers to claim)
-     * @dev Only callable by admin. Only allows rescue from raises with zero stakers.
+     * @notice Rescue tokens stranded by rounding dust or unclaimed-by-anyone raises.
+     * @dev ZXVC VIB-06 (2026-05): pre-fix this required totalStakedSnapshot == 0, which
+     *      meant any raise with even one staker locked the residual dust forever. Post-fix
+     *      rescue is allowed when any of three conditions hold:
+     *        (a) totalStakedSnapshot == 0 — original case, no eligible stakers existed
+     *        (b) eligibleClaimedShares >= totalStakedSnapshot — every eligible staker has
+     *            claimed their share, what remains is pure rounding dust
+     *        (c) block.timestamp > notifiedAt + RESCUE_DELAY — backstop for never-claimers
+     *            (e.g., lost-key stakers who never come back)
+     *      Same admin-only gate; same destination. The reward stays `active` after rescue
+     *      because some accounting fields are still meaningful.
      * @param escrow Escrow address
      * @param to Recipient address
      */
@@ -341,7 +392,12 @@ contract VibesStakerRewards is ReentrancyGuard {
         if (to == address(0)) revert ZeroAddress();
         RaiseReward storage reward = raiseRewards[escrow];
         if (!reward.active) revert RewardNotActive();
-        require(reward.totalStakedSnapshot == 0, "Has stakers");
+
+        // Allow rescue under any of the three conditions documented above.
+        bool noStakers = reward.totalStakedSnapshot == 0;
+        bool allClaimed = eligibleClaimedShares[escrow] >= reward.totalStakedSnapshot;
+        bool delayed = block.timestamp > reward.notifiedAt + RESCUE_DELAY;
+        require(noStakers || allClaimed || delayed, "Eligible stakers still pending");
 
         uint256 amount = reward.totalTokens - reward.claimedTokens;
         if (amount == 0) revert NothingToClaim();
@@ -372,17 +428,32 @@ contract VibesStakerRewards is ReentrancyGuard {
         if (reward.totalStakedSnapshot == 0) return (false, 0);
 
         // Read staker balance (view-only — doesn't cache)
+        // ZXVC VIB-04 (2026-05): drop the firstStakeTime gate here too. balanceAtSnapshot
+        // is authoritative for "was this staker eligible at notify time" — zero balance at
+        // snapshot means ineligible regardless of current firstStakeTime, and a non-zero
+        // balance means eligible regardless of whether the staker has since unstaked. Match
+        // _getStakerBalance's semantics so canClaim() and claim() never disagree.
         uint256 stakerBal;
         if (snapshotTaken[escrow][staker]) {
             stakerBal = stakerSnapshot[escrow][staker];
         } else {
-            // Check eligibility: must have been staking before notification
-            uint256 stakerFirstStake = IVibesStakingReadOnly(stakingContract).firstStakeTime(staker);
-            if (stakerFirstStake == 0 || stakerFirstStake >= reward.notifiedAt) return (false, 0);
-            // Audit fix F4: Use snapshot balance for accurate view
             uint256 snapId = raiseSnapshotId[escrow];
+            // Audit fix F4 + L-3: fall back to current balance ONLY if a snapshot id is
+            // somehow missing — this should never happen on the post-fix path because
+            // notifyReward always records a snapshot, but the fallback is fail-open for
+            // legacy raises rather than reverting in a view function.
             if (snapId > 0) {
                 stakerBal = IVibesStakingSnapshot(stakingContract).balanceAtSnapshot(snapId, staker);
+                // ZXVC VIB-06 (2026-05): mirror _getStakerBalance's same-block exclusion.
+                if (stakerBal > 0) {
+                    uint256 snapTs = IVibesStakingSnapshot(stakingContract).snapshotTimestamps(snapId);
+                    if (snapTs > 0) {
+                        uint256 stakerEverFirst = IVibesStakingReadOnly(stakingContract).everFirstStakeTime(staker);
+                        if (stakerEverFirst == 0 || stakerEverFirst >= snapTs) {
+                            stakerBal = 0;
+                        }
+                    }
+                }
             } else {
                 stakerBal = IVibesStakingReadOnly(stakingContract).stakedBalance(staker);
             }
@@ -493,6 +564,8 @@ interface IVibesStakingReadOnly {
     function stakedBalance(address staker) external view returns (uint256);
     function totalStaked() external view returns (uint256);
     function firstStakeTime(address staker) external view returns (uint256);
+    /// @notice ZXVC VIB-06 (2026-05): permanent first-stake timestamp (NOT reset on full unstake).
+    function everFirstStakeTime(address staker) external view returns (uint256);
 }
 
 /// @notice Audit fix F4: Snapshot interface for VibesStaking
@@ -500,4 +573,6 @@ interface IVibesStakingSnapshot {
     function takeSnapshot() external returns (uint256);
     function balanceAtSnapshot(uint256 snapshotId, address staker) external view returns (uint256);
     function totalStakedAtSnapshot(uint256 snapshotId) external view returns (uint256);
+    /// @notice ZXVC VIB-06 (2026-05): block.timestamp at which the snapshot was taken.
+    function snapshotTimestamps(uint256 snapshotId) external view returns (uint256);
 }

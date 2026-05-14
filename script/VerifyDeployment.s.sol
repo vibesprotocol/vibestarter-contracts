@@ -5,18 +5,24 @@ import "forge-std/Script.sol";
 
 /**
  * @title VerifyDeployment
- * @notice Verifies that deployed contracts are correctly configured and contracts.ts matches
- * @dev Run after each deployment: forge script script/VerifyDeployment.s.sol --rpc-url base_sepolia
+ * @notice Fail-closed verification that the deployed contract suite is wired correctly
+ *         and is "production ready" per the ZXVC 2026-05 audit checklist.
  *
- * This script:
- * 1. Calls unique methods on each contract to verify it's the correct type
- * 2. Checks cross-references (router -> escrowFactory, router -> lpLocker, etc.)
- * 3. Fails loudly if any mismatch is detected
+ * Run after each deployment:
+ *   forge script script/VerifyDeployment.s.sol --rpc-url base_sepolia
+ *   forge script script/VerifyDeployment.s.sol --rpc-url base
+ *
+ * ZXVC VIB-03 (2026-05) — this script previously counted failures and only logged at
+ * the end; a deployer could miss the "FAILED" summary and proceed. Every check now
+ * `revert`s with a clear message on failure so the deploy pipeline halts immediately.
+ *
+ * The check list is ported from the auditor's canonical
+ * `DeploymentPipeline.t._assertDeploymentReady` so the script and the test stay in lock-step.
  */
 contract VerifyDeployment is Script {
     // ============ PASTE YOUR ADDRESSES HERE AFTER DEPLOYMENT ============
     // These should match what you put in contracts.ts
-    // Updated: 2026-02-10 (security hardening + auto-refund + LP Locker access control)
+    // Update before each run; do NOT commit production addresses without a fresh review.
 
     address constant ROUTER = 0xc730dC49a40F978F3a48171cDa464a5fFDB1ddAa;
     address constant TOKEN_FACTORY = 0x1424Dd231bf56Beb7338DB0fc7d64a2A2297e715;
@@ -27,186 +33,130 @@ contract VerifyDeployment is Script {
     address constant MOCK_AERODROME_ROUTER = 0xB253FbF3220B27Cf0eb5f4142617b520Bf87Fb80;
     address constant TIME_ORACLE = 0x67d0Fe87433347587c6d3Bee6476eE6F3ae55f91;
 
+    // ZXVC VIB-03 (2026-05) — required for fail-closed deployment gate.
+    // Set these to the deployed VibesStaking + VibesStakerRewards addresses, the gnosis
+    // safe / multisig that owns the router, and the ops wallet that receives platform
+    // fees. Leave address(0) to skip the corresponding gate (e.g., pre-staking deploys).
+    address constant STAKING = address(0);
+    address constant STAKER_REWARDS = address(0);
+    address constant ROUTER_OWNER = address(0); // Expected router.owner() — the multisig.
+    address constant OPS_WALLET = address(0);   // Expected router.opsWallet().
+
     // ====================================================================
 
     function run() external view {
-        console.log("========== VERIFYING DEPLOYMENT ==========");
+        console.log("========== VERIFYING DEPLOYMENT (fail-closed) ==========");
         console.log("");
 
-        uint256 failures = 0;
+        // -- 1. Router wiring ---------------------------------------------------
+        console.log("1. Verifying VibesLaunchRouterV2 wiring...");
+        require(IRouter(ROUTER).tokenFactory() == TOKEN_FACTORY, "router.tokenFactory mismatch");
+        console.log("   OK: tokenFactory matches");
+        require(IRouter(ROUTER).registry() == REGISTRY, "router.registry mismatch");
+        console.log("   OK: registry matches");
+        require(IRouter(ROUTER).escrowFactory() == ESCROW_FACTORY, "router.escrowFactory mismatch");
+        console.log("   OK: escrowFactory matches");
+        require(IRouter(ROUTER).lpLocker() == LP_LOCKER, "router.lpLocker mismatch");
+        console.log("   OK: lpLocker matches");
 
-        // 1. Verify Router (has tokenFactory, registry, escrowFactory, lpLocker methods)
-        console.log("1. Verifying VibesLaunchRouterV2...");
-        try IRouter(ROUTER).tokenFactory() returns (address tf) {
-            if (tf != TOKEN_FACTORY) {
-                console.log("   FAIL: router.tokenFactory() =", tf);
-                console.log("         Expected:", TOKEN_FACTORY);
-                failures++;
-            } else {
-                console.log("   OK: tokenFactory matches");
-            }
-        } catch {
-            console.log("   FAIL: Cannot call tokenFactory() - wrong contract type?");
-            failures++;
-        }
-
-        try IRouter(ROUTER).registry() returns (address r) {
-            if (r != REGISTRY) {
-                console.log("   FAIL: router.registry() =", r);
-                console.log("         Expected:", REGISTRY);
-                failures++;
-            } else {
-                console.log("   OK: registry matches");
-            }
-        } catch {
-            console.log("   FAIL: Cannot call registry() - wrong contract type?");
-            failures++;
-        }
-
-        try IRouter(ROUTER).escrowFactory() returns (address ef) {
-            if (ef != ESCROW_FACTORY) {
-                console.log("   FAIL: router.escrowFactory() =", ef);
-                console.log("         Expected:", ESCROW_FACTORY);
-                failures++;
-            } else {
-                console.log("   OK: escrowFactory matches");
-            }
-        } catch {
-            console.log("   FAIL: Cannot call escrowFactory() - wrong contract type?");
-            failures++;
-        }
-
-        try IRouter(ROUTER).lpLocker() returns (address lp) {
-            if (lp != LP_LOCKER) {
-                console.log("   FAIL: router.lpLocker() =", lp);
-                console.log("         Expected:", LP_LOCKER);
-                failures++;
-            } else {
-                console.log("   OK: lpLocker matches");
-            }
-        } catch {
-            console.log("   FAIL: Cannot call lpLocker() - wrong contract type?");
-            failures++;
-        }
-
-        // 2. Verify LP Locker (has DEAD_ADDRESS, aerodromeRouter methods)
+        // -- 2. LP Locker -------------------------------------------------------
         console.log("");
         console.log("2. Verifying VibesLPLocker...");
-        try ILPLocker(LP_LOCKER).DEAD_ADDRESS() returns (address dead) {
-            if (dead == address(0xdead)) {
-                console.log("   OK: DEAD_ADDRESS = 0xdead (correct LP Locker)");
-            } else {
-                console.log("   WARN: DEAD_ADDRESS =", dead);
-            }
-        } catch {
-            console.log("   FAIL: Cannot call DEAD_ADDRESS() - NOT an LP Locker!");
-            failures++;
-        }
-
+        require(ILPLocker(LP_LOCKER).DEAD_ADDRESS() == address(0xdead), "lpLocker.DEAD_ADDRESS wrong");
+        console.log("   OK: DEAD_ADDRESS = 0xdead");
+        // aerodromeRouter is allowed to deviate on testnet — log without revert.
         try ILPLocker(LP_LOCKER).aerodromeRouter() returns (address ar) {
-            if (ar != MOCK_AERODROME_ROUTER) {
-                console.log("   WARN: lpLocker.aerodromeRouter() =", ar);
-                console.log("         Expected mockAerodromeRouter:", MOCK_AERODROME_ROUTER);
-            } else {
-                console.log("   OK: aerodromeRouter matches");
-            }
+            console.log("   INFO: aerodromeRouter =", ar);
         } catch {
-            console.log("   FAIL: Cannot call aerodromeRouter() - NOT an LP Locker!");
-            failures++;
+            revert("lpLocker.aerodromeRouter() unavailable");
         }
+        require(ILPLocker(LP_LOCKER).authorizedRouter() == ROUTER, "lpLocker.authorizedRouter mismatch");
+        console.log("   OK: lpLocker.authorizedRouter matches");
+        // ZXVC VIB-03 — implementation must be deployed before fee claimer clones can be created.
+        address feeImpl = ILPLocker(LP_LOCKER).feeClaimerImplementation();
+        require(feeImpl != address(0), "lpLocker.feeClaimerImplementation is zero");
+        require(feeImpl.code.length > 0, "lpLocker.feeClaimerImplementation has no code");
+        console.log("   OK: feeClaimerImplementation deployed");
 
-        // 3. Verify Escrow Factory (has implementation, authorizedRouter methods)
+        // -- 3. Escrow Factory --------------------------------------------------
         console.log("");
         console.log("3. Verifying VibesTranchEscrowFactory...");
-        try IEscrowFactory(ESCROW_FACTORY).implementation() returns (address impl) {
-            if (impl != ESCROW_IMPL) {
-                console.log("   FAIL: escrowFactory.implementation() =", impl);
-                console.log("         Expected:", ESCROW_IMPL);
-                failures++;
-            } else {
-                console.log("   OK: implementation matches");
-            }
-        } catch {
-            console.log("   FAIL: Cannot call implementation() - NOT an Escrow Factory!");
-            failures++;
-        }
+        require(IEscrowFactory(ESCROW_FACTORY).implementation() == ESCROW_IMPL, "escrowFactory.implementation mismatch");
+        console.log("   OK: implementation matches");
+        require(IEscrowFactory(ESCROW_FACTORY).authorizedRouter() == ROUTER, "escrowFactory.authorizedRouter mismatch");
+        console.log("   OK: escrowFactory.authorizedRouter matches");
+        require(IEscrowFactory(ESCROW_FACTORY).lpLocker() == LP_LOCKER, "escrowFactory.lpLocker mismatch");
+        console.log("   OK: escrowFactory.lpLocker matches");
 
-        try IEscrowFactory(ESCROW_FACTORY).authorizedRouter() returns (address ar) {
-            if (ar != ROUTER) {
-                console.log("   FAIL: escrowFactory.authorizedRouter() =", ar);
-                console.log("         Expected:", ROUTER);
-                failures++;
-            } else {
-                console.log("   OK: authorizedRouter matches");
-            }
-        } catch {
-            console.log("   FAIL: Cannot call authorizedRouter() - NOT an Escrow Factory!");
-            failures++;
-        }
-
-        // 4. Verify Registry (has authorizedRouters method)
+        // -- 4. Registry --------------------------------------------------------
         console.log("");
-        console.log("4. Verifying VibesRegistry...");
-        try IRegistry(REGISTRY).authorizedRouters(ROUTER) returns (bool authorized) {
-            if (!authorized) {
-                console.log("   WARN: Router not authorized in registry");
-            } else {
-                console.log("   OK: Router is authorized in registry");
-            }
-        } catch {
-            console.log("   FAIL: Cannot call authorizedRouters() - NOT a Registry!");
-            failures++;
-        }
+        console.log("4. Verifying VibesRegistry authorization...");
+        require(IRegistry(REGISTRY).authorizedRouters(ROUTER), "registry: router not authorized");
+        console.log("   OK: router authorized in registry");
 
-        // 5. Verify Token Factory (by checking code exists)
+        // -- 5. Token Factory ---------------------------------------------------
         console.log("");
-        console.log("5. Verifying VibesTokenFactory...");
-        if (TOKEN_FACTORY.code.length > 0) {
-            console.log("   OK: Contract exists at TOKEN_FACTORY address");
-        } else {
-            console.log("   FAIL: No contract at TOKEN_FACTORY address!");
-            failures++;
-        }
+        console.log("5. Verifying VibesTokenFactory exists...");
+        require(TOKEN_FACTORY.code.length > 0, "tokenFactory has no code");
+        console.log("   OK: TokenFactory contract present");
 
-        // 6. Verify Escrow Implementation (has KICKSTART_BPS constant)
+        // -- 6. Escrow implementation ------------------------------------------
         console.log("");
-        console.log("6. Verifying VibesTranchEscrow (impl)...");
-        try IEscrow(ESCROW_IMPL).KICKSTART_BPS() returns (uint256 bps) {
-            if (bps == 1000) { // 10%
-                console.log("   OK: KICKSTART_BPS = 1000 (correct Escrow impl)");
-            } else {
-                console.log("   WARN: KICKSTART_BPS =", bps);
-            }
-        } catch {
-            console.log("   FAIL: Cannot call KICKSTART_BPS() - NOT an Escrow impl!");
-            failures++;
-        }
+        console.log("6. Verifying VibesTranchEscrow implementation...");
+        require(IEscrow(ESCROW_IMPL).KICKSTART_BPS() == 1000, "escrow impl: KICKSTART_BPS != 1000");
+        console.log("   OK: KICKSTART_BPS = 1000");
 
-        // 7. Verify Time Oracle (if set)
+        // -- 7. Time oracle (must be zero + locked on mainnet) ------------------
         console.log("");
-        console.log("7. Verifying MockTimeOracle...");
+        console.log("7. Verifying time oracle state...");
+        // ZXVC VIB-03 — production must use block.timestamp (timeOracle == 0) and the
+        // oracle latch must be engaged so no future admin can re-introduce a fast-forward.
+        require(IEscrowFactory(ESCROW_FACTORY).timeOracle() == address(0), "escrowFactory.timeOracle: production must be zero");
+        require(IEscrowFactory(ESCROW_FACTORY).timeOracleLocked(), "escrowFactory.timeOracleLocked: must be true");
+        console.log("   OK: timeOracle == 0 and timeOracleLocked == true");
         if (TIME_ORACLE != address(0)) {
-            try ITimeOracle(TIME_ORACLE).getTime() returns (uint256 t) {
-                console.log("   OK: getTime() =", t);
-            } catch {
-                console.log("   FAIL: Cannot call getTime() - NOT a Time Oracle!");
-                failures++;
-            }
-        } else {
-            console.log("   SKIP: No time oracle configured");
+            console.log("   INFO: TIME_ORACLE constant set to", TIME_ORACLE, "but escrow factory must NOT reference it on mainnet");
         }
 
-        // Summary
+        // -- 8. Router ownership (ZXVC VIB-03 + Wave 1 ownership gate) ----------
         console.log("");
-        console.log("==========================================");
-        if (failures == 0) {
-            console.log("SUCCESS: All verifications passed!");
-            console.log("contracts.ts addresses are correctly configured.");
+        console.log("8. Verifying router ownership state...");
+        require(IRouter(ROUTER).pendingOwner() == address(0), "router.pendingOwner: ownership transfer not accepted");
+        console.log("   OK: router.pendingOwner == 0 (transfer accepted)");
+        if (ROUTER_OWNER != address(0)) {
+            require(IRouter(ROUTER).owner() == ROUTER_OWNER, "router.owner mismatch");
+            console.log("   OK: router.owner matches ROUTER_OWNER");
         } else {
-            console.log("FAILED:", failures, "verification(s) failed!");
-            console.log("CHECK YOUR contracts.ts ADDRESSES!");
+            console.log("   SKIP: ROUTER_OWNER constant not set");
         }
-        console.log("==========================================");
+        if (OPS_WALLET != address(0)) {
+            require(IRouter(ROUTER).opsWallet() == OPS_WALLET, "router.opsWallet mismatch");
+            console.log("   OK: router.opsWallet matches OPS_WALLET");
+        } else {
+            console.log("   SKIP: OPS_WALLET constant not set");
+        }
+
+        // -- 9. Staker rewards + snapshot authorisation (ZXVC VIB-03) -----------
+        console.log("");
+        console.log("9. Verifying staker rewards wiring...");
+        if (STAKING != address(0) && STAKER_REWARDS != address(0)) {
+            require(IStaking(STAKING).snapshotAuthorized(STAKER_REWARDS), "staking.snapshotAuthorized(stakerRewards) is false");
+            console.log("   OK: staking.snapshotAuthorized(stakerRewards) == true");
+            require(IStakerRewards(STAKER_REWARDS).authorizedRouter() == ROUTER, "stakerRewards.authorizedRouter mismatch");
+            console.log("   OK: stakerRewards.authorizedRouter matches");
+            require(IStakerRewards(STAKER_REWARDS).stakingContract() == STAKING, "stakerRewards.stakingContract mismatch");
+            console.log("   OK: stakerRewards.stakingContract matches");
+            require(IRouter(ROUTER).stakerRewardsContract() == STAKER_REWARDS, "router.stakerRewardsContract mismatch");
+            console.log("   OK: router.stakerRewardsContract matches");
+        } else {
+            console.log("   SKIP: STAKING / STAKER_REWARDS constants not set - staking deploy not yet verified");
+        }
+
+        console.log("");
+        console.log("========================================================");
+        console.log("SUCCESS: All fail-closed checks passed");
+        console.log("Deployment matches the ZXVC 2026-05 production-ready checklist.");
+        console.log("========================================================");
     }
 }
 
@@ -216,16 +166,25 @@ interface IRouter {
     function registry() external view returns (address);
     function escrowFactory() external view returns (address);
     function lpLocker() external view returns (address);
+    function opsWallet() external view returns (address);
+    function owner() external view returns (address);
+    function pendingOwner() external view returns (address);
+    function stakerRewardsContract() external view returns (address);
 }
 
 interface ILPLocker {
     function DEAD_ADDRESS() external view returns (address);
     function aerodromeRouter() external view returns (address);
+    function authorizedRouter() external view returns (address);
+    function feeClaimerImplementation() external view returns (address);
 }
 
 interface IEscrowFactory {
     function implementation() external view returns (address);
     function authorizedRouter() external view returns (address);
+    function lpLocker() external view returns (address);
+    function timeOracle() external view returns (address);
+    function timeOracleLocked() external view returns (bool);
 }
 
 interface IRegistry {
@@ -236,6 +195,11 @@ interface IEscrow {
     function KICKSTART_BPS() external view returns (uint256);
 }
 
-interface ITimeOracle {
-    function getTime() external view returns (uint256);
+interface IStaking {
+    function snapshotAuthorized(address) external view returns (bool);
+}
+
+interface IStakerRewards {
+    function authorizedRouter() external view returns (address);
+    function stakingContract() external view returns (address);
 }

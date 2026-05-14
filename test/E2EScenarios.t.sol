@@ -506,8 +506,8 @@ contract E2EScenariosTest is Test {
         // Founder claims tranche 1
         _claimMonthlyTranche(escrow, 1);
 
-        // Wire locked addresses for redeemable supply calculation
-        escrow.setLockedAddresses(vestingAddr, stakerRewardsAddr);
+        // Locked addresses are wired automatically by the router during Phase 2 finalisation
+        // (and latched there by ZXVC VIB-02 fix). No manual call needed here.
 
         // --- Backer1 challenges tranche 2 ---
         vm.warp(escrow.getTrancheUnlockTime(2) + 1);

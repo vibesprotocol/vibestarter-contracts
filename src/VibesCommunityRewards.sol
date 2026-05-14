@@ -269,6 +269,13 @@ contract VibesCommunityRewards is ReentrancyGuard {
         bytes32 leaf = keccak256(abi.encodePacked(keccak256(abi.encodePacked(recipient, amount))));
         if (!MerkleProof.verify(proof, b.merkleRoot, leaf)) revert InvalidProof();
 
+        // ZXVC VIB-10 (2026-05): hard cap claim-time aggregate to the declared batch total.
+        // A malicious / sloppy operator could otherwise commit a merkle root whose leaf-sum
+        // exceeds b.totalAmount and drain more than was deposited into the batch. The
+        // per-recipient hasClaimed guard prevents double-claim per leaf, but does NOT bound
+        // the aggregate; this require does.
+        require(b.claimedAmount + amount <= b.totalAmount, "Exceeds batch total");
+
         claimed[batchId][recipient] = true;
         b.claimedAmount += amount;
 

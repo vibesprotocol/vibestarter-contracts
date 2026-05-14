@@ -8,12 +8,13 @@ Smart contracts for [Vibestarter](https://vibestarter.xyz) — a crowdfunding pl
 
 ## Reading order for reviewers
 
-1. **`docs/audits/pre-mainnet-friend-review-2026-05.md`** — short orientation: where to spend the first 2 hours, the two flagged findings to gut-check, how to flag stuff back. Start here.
-2. **`docs/audits/external-audit-prep-2026-05.md`** — deeper technical brief (~530 lines): risk-ranked review priorities with file:line citations, threat model, deploy-script wiring, prior audit history. Read this when you want to drill in.
-3. **`docs/smart-contracts.md`** — contract inventory, key constants, security patterns.
-4. **`docs/privileged-roles.md`** — full admin/owner role table (M-1 master admin, M-3 operations admin, trusted signers, etc.).
-5. **`docs/funding-mechanics.md`** — how money flows: raise types, tranche schedule, challenge system, refund conditions.
-6. **`docs/pending-contract-changes.md`** — log of every contract change since the last external audit (PC-01..PC-05 + 48 numbered items).
+1. **`docs/audits/zxvc-audit-response-2026-05.md`** — our point-by-point response to the ZXVC 2026-05 audit: each of the 14 findings (11 formal + 3 PoC-bundle extras), the fix that landed, the commit hash, and the PoC test that asserts the post-fix behaviour. Read this first if you're coming from the ZXVC report.
+2. **`docs/audits/pre-mainnet-friend-review-2026-05.md`** — short orientation: where to spend the first 2 hours, the two flagged findings to gut-check, how to flag stuff back.
+3. **`docs/audits/external-audit-prep-2026-05.md`** — deeper technical brief (~530 lines): risk-ranked review priorities with file:line citations, threat model, deploy-script wiring, prior audit history. Read this when you want to drill in.
+4. **`docs/smart-contracts.md`** — contract inventory, key constants, security patterns.
+5. **`docs/privileged-roles.md`** — full admin/owner role table (M-1 master admin, M-3 operations admin, trusted signers, etc.).
+6. **`docs/funding-mechanics.md`** — how money flows: raise types, tranche schedule, challenge system, refund conditions.
+7. **`docs/pending-contract-changes.md`** — log of every contract change since the last external audit (PC-01..PC-05 + 48 numbered items).
 
 ---
 

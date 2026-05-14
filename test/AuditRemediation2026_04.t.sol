@@ -32,10 +32,14 @@ contract MockPool {
     function setBalance(address holder, uint256 amount) external { balanceOf[holder] = amount; }
 }
 
-// Mock Aerodrome router stub (LP locker constructor needs an address; not exercised here).
+// Mock Aerodrome router stub. ZXVC VIB-09 (2026-05) made the locker call poolFor during
+// recordManualLPLock to enforce the canonical-pool gate, so this mock now exposes a
+// settable return value (default address(0)).
 contract MockAeroRouter {
+    address public mockedPool;
+    function setMockedPool(address pool) external { mockedPool = pool; }
     function weth() external pure returns (address) { return address(0); }
-    function poolFor(address, address, bool, address) external pure returns (address) { return address(0); }
+    function poolFor(address, address, bool, address) external view returns (address) { return mockedPool; }
 }
 
 // -------------------------------------------------------------------------
@@ -136,6 +140,8 @@ contract AuditRemediation2026_04 is Test {
         MockPool pool = new MockPool();
         uint256 lpAmt = 12345;
         pool.setBalance(DEAD, lpAmt);
+        // ZXVC VIB-09 (2026-05): locker now requires _pool == aero.poolFor(...). Wire the mock.
+        aero.setMockedPool(address(pool));
 
         // Pre: rescued, not locked.
         assertTrue(l.hasRescuedLP(campaign));
@@ -196,6 +202,8 @@ contract AuditRemediation2026_04 is Test {
         MockPool pool = new MockPool();
         // Insufficient: 1 wei < claimed 1 ether
         pool.setBalance(DEAD, 1 wei);
+        // ZXVC VIB-09 (2026-05): wire the canonical pool so we exercise the LP-proof gate.
+        aero.setMockedPool(address(pool));
 
         vm.prank(admin);
         vm.expectRevert(VibesLPLocker.InvalidLPProof.selector);
@@ -241,6 +249,8 @@ contract AuditRemediation2026_04 is Test {
         _injectRescue(l, campaign);
         MockPool pool = new MockPool();
         pool.setBalance(DEAD, 1 ether);
+        // ZXVC VIB-09 (2026-05): wire the canonical pool so the first call succeeds.
+        aero.setMockedPool(address(pool));
 
         vm.prank(admin);
         l.recordManualLPLock(campaign, address(pool), address(0), 1 ether);

@@ -506,18 +506,35 @@ contract AuditFixesTest is Test {
         assertEq(escrow.vestingContract(), vestingAddr, "Vesting contract should be auto-wired");
     }
 
-    function test_setLockedAddresses_allowsRouter() public {
-        (address token, VibesTranchEscrow escrow) = _fundAndFinalize();
+    /// @notice ZXVC VIB-02 (2026-05) regression — production fund-flow path.
+    /// @dev Previously this test asserted the router could overwrite vesting / stakerRewards
+    ///      after finalisation. That behaviour was the exact admin-manipulation surface
+    ///      VIB-02 exploited (via the admin branch of the same setter). The router now
+    ///      latches custody addresses via finalizeLockedAddresses() at the end of Phase 2,
+    ///      after which neither admin nor router can change them. This test covers the
+    ///      VIB-02 invariant under the real launchTokenAndDistribute / Phase 2 flow;
+    ///      Specialist3ManualAudit.test_VIB02_custodySettersLockedAfterRouterFinalization
+    ///      covers the same invariant against a synthetic mock router setup.
+    function test_VIB02_setLockedAddresses_lockedAfterFinalization() public {
+        (, VibesTranchEscrow escrow) = _fundAndFinalize();
 
-        // Router should be able to call setLockedAddresses (not just admin)
-        address newVesting = makeAddr("newVesting");
-        address newStaker = makeAddr("newStaker");
+        // Sanity: production Phase 2 must have latched the custody addresses.
+        assertTrue(escrow.lockedAddressesFinalized(), "Phase 2 must latch custody addresses");
 
+        // Router cannot rewire vesting / stakerRewards after finalisation.
         vm.prank(address(router));
-        escrow.setLockedAddresses(newVesting, newStaker);
+        vm.expectRevert("Locked");
+        escrow.setLockedAddresses(makeAddr("newVesting"), makeAddr("newStaker"));
 
-        assertEq(escrow.vestingContract(), newVesting);
-        assertEq(escrow.stakerRewards(), newStaker);
+        // setTreasuryContract is locked by the same latch.
+        vm.prank(address(router));
+        vm.expectRevert("Locked");
+        escrow.setTreasuryContract(makeAddr("newTreasury"));
+
+        // Calling finalizeLockedAddresses() again reverts — one-shot invariant.
+        vm.prank(address(router));
+        vm.expectRevert("Already finalized");
+        escrow.finalizeLockedAddresses();
     }
 
     function test_setLockedAddresses_rejectsStranger() public {

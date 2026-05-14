@@ -212,6 +212,13 @@ contract VibesRegistry {
     ) internal {
         // Validation
         require(token != address(0), "Invalid token");
+        // ZXVC VIB-07 (2026-05): defeat registry squatting. An attacker who computes a
+        // predicted CREATE/CREATE2 address for a future factory deployment could otherwise
+        // call register() before the factory deploys the token and lock in attacker-chosen
+        // provenance (founder, capsule, attestation). Requiring code at the token address
+        // means the token must already be deployed — the legitimate factory path is
+        // unaffected because the token is deployed BEFORE registerFromRouter is invoked.
+        require(token.code.length > 0, "Token has no code");
         require(founder != address(0), "Invalid founder");
         require(!isRegistered[token], "Already registered");
         require(capsuleHash != bytes32(0), "Capsule hash required");

@@ -176,18 +176,27 @@ contract VibesRouterExtension is VibesRouterStorage {
         address stakerDest = _pendingStakerRecipient[token];
 
         if (stakerTokens > 0 && stakerDest != address(0) && stakerDest.code.length > 0) {
-            // Transfer: only if not already done (checkpoint flag prevents double-transfer)
+            // ZXVC VIB-03 (2026-05): notify BEFORE transfer, no try/catch.
+            //
+            // The previous order (transfer → try/catch notify) allowed a deployment with
+            // staking.snapshotAuthorized(stakerRewards) == false to reach FullyComplete
+            // while leaving tokens permanently stranded in stakerRewards with
+            // reward.active == false (no claim path opens, no rescuePath exists). With
+            // notify-first, takeSnapshot's authorisation check reverts up through
+            // _executePhase2 → state fully rolls back → tokens are NOT transferred.
+            // Invariant: tokens never sit in stakerRewards while reward.active == false.
+            VibesStakerRewards(stakerDest).notifyReward(token, stakerTokens, escrowAddr);
+            emit StakerRewardsAllocated(token, stakerDest, stakerTokens);
+
+            // Transfer after notify succeeded. The _stakerTokensTransferred checkpoint
+            // is kept as a belt-and-braces double-transfer guard, but with notify-first
+            // it's not needed for retry safety — Phase 2 is atomic within a tx, so a
+            // notify-then-revert path rolls back both state changes together; if notify
+            // already succeeded in a prior tx, that tx must have completed Phase 2 and
+            // there is no retry from this path.
             if (!_stakerTokensTransferred[token]) {
                 IERC20(token).safeTransfer(stakerDest, stakerTokens);
-                _stakerTokensTransferred[token] = true; // Set IMMEDIATELY after transfer
-            }
-
-            // Notify: independent of transfer — retries if prior notify failed
-            // notifyReward has RewardAlreadySet guard for idempotent retry
-            try VibesStakerRewards(stakerDest).notifyReward(token, stakerTokens, escrowAddr) {
-                emit StakerRewardsAllocated(token, stakerDest, stakerTokens);
-            } catch (bytes memory reason) {
-                emit StakerRewardsNotifyFailed(token, reason);
+                _stakerTokensTransferred[token] = true;
             }
         } else if (stakerTokens > 0) {
             emit StakerTokensRedirectedToBackers(token, stakerTokens);
@@ -200,6 +209,9 @@ contract VibesRouterExtension is VibesRouterStorage {
         if (treasuryAddr != address(0)) {
             escrow.setTreasuryContract(treasuryAddr);
         }
+        // ZXVC VIB-02 (2026-05): latch custody addresses so admin cannot manipulate the
+        // refund denominator post-Phase-2 to extract frozenEthBalance.
+        escrow.finalizeLockedAddresses();
 
         // === Record backer tokens available for claims ===
         uint256 routerBalance = IERC20(token).balanceOf(address(this));

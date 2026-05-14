@@ -195,6 +195,15 @@ contract VibesTokenDistributorV2 is ReentrancyGuard {
 
         hasClaimed[msg.sender] = true;
 
+        // ZXVC Extra-2 (2026-05): aggregate caps mirror VIB-10 for the legacy distributor.
+        // The per-recipient hasClaimed guard prevents double-claim per leaf but does NOT
+        // bound the aggregate, so a malicious / mis-built merkle root whose leaf-sum exceeds
+        // the configured totals could drain more than was deposited. These requires bound
+        // claims to the configured budget. This is defense-in-depth on a deprecated path
+        // (router migration replaces this distributor for new raises).
+        require(totalTokensClaimed + tokenAmount <= totalTokens, "Exceeds totalTokens");
+        require(totalEthClaimed + ethRefund <= totalEthRefunds, "Exceeds totalEthRefunds");
+
         // Transfer tokens if any
         if (tokenAmount > 0) {
             totalTokensClaimed += tokenAmount;

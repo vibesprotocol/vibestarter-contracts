@@ -377,7 +377,11 @@ contract VibesStakerRewardsTest is Test {
         assertEq(vibetoken1.balanceOf(staker1), REWARD_AMOUNT);
     }
 
-    function test_snapshot_unstakeFullyThenClaim() public {
+    /// @notice ZXVC VIB-04 (2026-05) — historical stakers retain claim eligibility after full unstake.
+    /// @dev Pre-fix this test asserted the BUG: full unstake reset firstStakeTime to 0, the
+    ///      stale eligibility gate then blocked the claim. After fix, balanceAtSnapshot is
+    ///      authoritative and the historical staker can still claim their snapshotted share.
+    function test_VIB04_snapshot_unstakeFullyThenClaim() public {
         // staker1 stakes, raise happens, staker1 fully unstakes
         _stakeAsAndAdvance(staker1, 100_000 ether);
 
@@ -390,9 +394,17 @@ contract VibesStakerRewardsTest is Test {
         vm.prank(staker1);
         staking.unstake(100_000 ether);
 
-        // After full unstake, firstStakeTime is reset to 0 → ineligible
-        (bool canClaimResult, ) = rewards.canClaim(escrow1, staker1);
-        assertFalse(canClaimResult);
+        // ZXVC VIB-04: firstStakeTime is reset to 0, but balanceAtSnapshot still records
+        // the pre-unstake balance — staker remains eligible based on snapshot.
+        assertEq(staking.firstStakeTime(staker1), 0, "VibesStaking resets firstStakeTime on full unstake");
+        (bool canClaimResult, uint256 quoted) = rewards.canClaim(escrow1, staker1);
+        assertTrue(canClaimResult, "historical staker remains eligible despite full unstake");
+        assertEq(quoted, REWARD_AMOUNT, "sole-staker quote should be the full reward");
+
+        // Claim succeeds and pays the full snapshotted share.
+        vm.prank(staker1);
+        rewards.claim(escrow1);
+        assertEq(vibetoken1.balanceOf(staker1), REWARD_AMOUNT, "staker receives full reward share");
     }
 
     function test_snapshot_partialUnstakeAfterNotify_canStillClaim() public {
@@ -559,8 +571,10 @@ contract VibesStakerRewardsTest is Test {
         _stakeAsAndAdvance(staker1, 100_000 ether);
         _notifyRewardAs(address(vibetoken1), REWARD_AMOUNT, escrow1);
 
+        // ZXVC VIB-06 (2026-05): revert message refined — rescue is now blocked when
+        // eligible stakers are still pending (not just when stakers exist at all).
         vm.prank(admin);
-        vm.expectRevert("Has stakers");
+        vm.expectRevert("Eligible stakers still pending");
         rewards.rescueUnclaimable(escrow1, admin);
     }
 

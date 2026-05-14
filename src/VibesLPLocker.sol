@@ -398,6 +398,21 @@ contract VibesLPLocker is ReentrancyGuard {
         if (_pool == address(0) || _pool.code.length == 0) revert InvalidPool();
         if (_lpAmount == 0) revert InvalidLPAmount();
 
+        // ZXVC VIB-09 (2026-05): require _pool to be the canonical Aerodrome volatile pair
+        // for (rescue.token, WETH) per the configured factory. The locker's auto-lock path
+        // creates LP in exactly this pool (createAndLockLP:285), so the manual fallback must
+        // record the same pool. Without this gate, an admin (compromised or careless) could
+        // record an arbitrary ERC-20 as the "pool" and route Aerodrome fee accrual nowhere
+        // useful (or to attacker-controlled storage), bypassing the LP-locked-indefinitely
+        // protocol invariant.
+        {
+            address weth = IAerodromeRouter(aerodromeRouter).weth();
+            address canonicalPool = IAerodromeRouter(aerodromeRouter).poolFor(
+                rescue.token, weth, false, aerodromeFactory
+            );
+            if (_pool != canonicalPool) revert InvalidPool();
+        }
+
         // Resolve the holder whose balance we'll prove. A claimer must be wired correctly
         // for this campaign+pool; otherwise reject rather than let fees leak to the wrong place.
         address holder;
@@ -405,6 +420,11 @@ contract VibesLPLocker is ReentrancyGuard {
             holder = DEAD_ADDRESS;
         } else {
             if (_feeClaimer.code.length == 0) revert InvalidFeeClaimer();
+            // ZXVC VIB-09 (2026-05): require _feeClaimer to be an EIP-1167 minimal proxy of
+            // the current feeClaimerImplementation. Without this, an admin could plug in a
+            // bespoke holder contract with a transfer/withdraw surface (the auditor's
+            // WithdrawableLPHolder PoC), defeating the soulbound-LP property.
+            if (!_isCloneOfImplementation(_feeClaimer)) revert InvalidFeeClaimer();
             if (VibesLPFeeClaimer(_feeClaimer).pool() != _pool) revert InvalidFeeClaimer();
             if (VibesLPFeeClaimer(_feeClaimer).campaign() != _campaign) revert InvalidFeeClaimer();
             holder = _feeClaimer;
@@ -432,6 +452,24 @@ contract VibesLPLocker is ReentrancyGuard {
         campaignToPosition[_campaign] = positionIndex;
 
         emit ManualLPLockRecorded(_campaign, _pool, _lpAmount, msg.sender);
+    }
+
+    /// @dev ZXVC VIB-09 (2026-05): verify `proxy` is an EIP-1167 minimal proxy whose
+    ///      implementation slot matches the current feeClaimerImplementation. This is the
+    ///      same bytecode shape OZ Clones.clone() produces (45 bytes, deterministic).
+    function _isCloneOfImplementation(address proxy) internal view returns (bool) {
+        address impl = feeClaimerImplementation;
+        if (impl == address(0)) return false;
+        // Build the exact runtime bytecode the OZ Clones library produces:
+        //   0x363d3d373d3d3d363d73 <impl-20-bytes> 0x5af43d82803e903d91602b57fd5bf3
+        bytes memory expected = abi.encodePacked(
+            hex"363d3d373d3d3d363d73",
+            bytes20(impl),
+            hex"5af43d82803e903d91602b57fd5bf3"
+        );
+        bytes memory actual = proxy.code;
+        if (actual.length != expected.length) return false;
+        return keccak256(actual) == keccak256(expected);
     }
 
     /// @notice Set or rotate the VibesLPFeeClaimer implementation used for cloning.
